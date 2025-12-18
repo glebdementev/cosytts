@@ -174,7 +174,7 @@ Follow the code in `example.py` for detailed usage of each model.
 ```sh
 python example.py  # original way
 
-python run.py  # faster way
+uv run python run.py  # faster way
 ```
 
 #### CosyVoice2 vllm Usage

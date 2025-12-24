@@ -33,6 +33,7 @@ from typing import Generator, Dict
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 
 from cosyvoice.utils.file_utils import logging, convert_onnx_to_trt
 from cosyvoice.utils.common import TrtContextWrapper
@@ -650,3 +651,170 @@ class FastCosyVoice3Model:
             
         finally:
             pass  # GPU tensors will be freed when function exits
+    
+    def tts(
+        self,
+        text: torch.Tensor = torch.zeros(1, 0, dtype=torch.int32),
+        flow_embedding: torch.Tensor = torch.zeros(0, 192),
+        llm_embedding: torch.Tensor = torch.zeros(0, 192),
+        prompt_text: torch.Tensor = torch.zeros(1, 0, dtype=torch.int32),
+        llm_prompt_speech_token: torch.Tensor = torch.zeros(1, 0, dtype=torch.int32),
+        flow_prompt_speech_token: torch.Tensor = torch.zeros(1, 0, dtype=torch.int32),
+        prompt_speech_feat: torch.Tensor = torch.zeros(1, 0, 80),
+        speed: float = 1.0,
+        **kwargs
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Non-streaming TTS inference.
+        
+        Generates all speech tokens first, then converts them to audio in one pass.
+        This is simpler and can be slightly faster for short texts, but has higher
+        latency to first audio compared to streaming.
+        
+        Args:
+            text: Input text tokens
+            flow_embedding: Speaker embedding for flow
+            llm_embedding: Speaker embedding for LLM
+            prompt_text: Prompt text tokens
+            llm_prompt_speech_token: Prompt speech tokens for LLM
+            flow_prompt_speech_token: Prompt speech tokens for flow
+            prompt_speech_feat: Prompt speech features
+            speed: Speech speed multiplier (1.0 = normal)
+        
+        Returns:
+            Dict with 'tts_speech' key containing full audio tensor [1, audio_len]
+        """
+        # Shared state for LLM thread
+        tokens: list = []
+        tokens_lock = threading.Lock()
+        llm_end_flag = {'done': False}
+        
+        # Start LLM thread
+        llm_thread = threading.Thread(
+            target=self._llm_job,
+            args=(text, prompt_text, llm_prompt_speech_token, llm_embedding,
+                  tokens, llm_end_flag, tokens_lock),
+            daemon=True
+        )
+        llm_thread.start()
+        
+        # Wait for LLM to finish generating all tokens
+        llm_thread.join()
+        
+        # Get all tokens
+        with tokens_lock:
+            all_tokens = list(tokens)
+        
+        if not all_tokens:
+            logging.warning('[TTS] No tokens generated')
+            return {'tts_speech': torch.zeros(1, 0)}
+        
+        # Convert tokens to audio in one pass
+        dtype = torch.float16 if self.fp16 else torch.float32
+        tokens_gpu = torch.tensor(all_tokens, dtype=torch.int32, device=self.device).unsqueeze(0)
+        token_len_gpu = torch.tensor([tokens_gpu.shape[1]], dtype=torch.int32, device=self.device)
+        flow_prompt_token_gpu = flow_prompt_speech_token.to(self.device)
+        flow_prompt_token_len_gpu = torch.tensor([flow_prompt_speech_token.shape[1]], dtype=torch.int32, device=self.device)
+        prompt_feat_gpu = prompt_speech_feat.to(self.device, dtype=dtype)
+        prompt_feat_len_gpu = torch.tensor([prompt_speech_feat.shape[1]], dtype=torch.int32, device=self.device)
+        flow_embedding_gpu = flow_embedding.to(self.device, dtype=dtype)
+        
+        with torch.inference_mode():
+            # Flow inference - non-streaming mode
+            flow_start = time.time()
+            tts_mel, _ = self.flow.inference(
+                token=tokens_gpu,
+                token_len=token_len_gpu,
+                prompt_token=flow_prompt_token_gpu,
+                prompt_token_len=flow_prompt_token_len_gpu,
+                prompt_feat=prompt_feat_gpu,
+                prompt_feat_len=prompt_feat_len_gpu,
+                embedding=flow_embedding_gpu,
+                streaming=False,
+                finalize=True
+            )
+            flow_elapsed = time.time() - flow_start
+            logging.info(f'[Flow] non-streaming inference: {flow_elapsed:.3f}s')
+            
+            # Apply speed change if requested
+            if speed != 1.0:
+                tts_mel = F.interpolate(tts_mel, size=int(tts_mel.shape[2] / speed), mode='linear')
+            
+            # Hift inference - non-streaming mode
+            hift_start = time.time()
+            tts_speech, _ = self.hift.inference(
+                speech_feat=tts_mel.float(),
+                finalize=True
+            )
+            hift_elapsed = time.time() - hift_start
+            logging.info(f'[HiFT] non-streaming inference: {hift_elapsed:.3f}s')
+        
+        return {'tts_speech': tts_speech.cpu()}
+    
+    def tts_with_external_tokens(
+        self,
+        tokens: list,
+        flow_embedding: torch.Tensor = torch.zeros(0, 192),
+        flow_prompt_speech_token: torch.Tensor = torch.zeros(1, 0, dtype=torch.int32),
+        prompt_speech_feat: torch.Tensor = torch.zeros(1, 0, 80),
+        speed: float = 1.0,
+        **kwargs
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Non-streaming TTS with pre-generated tokens (for TRT-LLM).
+        
+        Args:
+            tokens: Pre-generated speech tokens
+            flow_embedding: Speaker embedding for flow
+            flow_prompt_speech_token: Prompt speech tokens for flow
+            prompt_speech_feat: Prompt speech features
+            speed: Speech speed multiplier (1.0 = normal)
+        
+        Returns:
+            Dict with 'tts_speech' key containing full audio tensor [1, audio_len]
+        """
+        if not tokens:
+            logging.warning('[TTS] No tokens provided')
+            return {'tts_speech': torch.zeros(1, 0)}
+        
+        # Convert tokens to audio in one pass
+        dtype = torch.float16 if self.fp16 else torch.float32
+        tokens_gpu = torch.tensor(tokens, dtype=torch.int32, device=self.device).unsqueeze(0)
+        token_len_gpu = torch.tensor([tokens_gpu.shape[1]], dtype=torch.int32, device=self.device)
+        flow_prompt_token_gpu = flow_prompt_speech_token.to(self.device)
+        flow_prompt_token_len_gpu = torch.tensor([flow_prompt_speech_token.shape[1]], dtype=torch.int32, device=self.device)
+        prompt_feat_gpu = prompt_speech_feat.to(self.device, dtype=dtype)
+        prompt_feat_len_gpu = torch.tensor([prompt_speech_feat.shape[1]], dtype=torch.int32, device=self.device)
+        flow_embedding_gpu = flow_embedding.to(self.device, dtype=dtype)
+        
+        with torch.inference_mode():
+            # Flow inference - non-streaming mode
+            flow_start = time.time()
+            tts_mel, _ = self.flow.inference(
+                token=tokens_gpu,
+                token_len=token_len_gpu,
+                prompt_token=flow_prompt_token_gpu,
+                prompt_token_len=flow_prompt_token_len_gpu,
+                prompt_feat=prompt_feat_gpu,
+                prompt_feat_len=prompt_feat_len_gpu,
+                embedding=flow_embedding_gpu,
+                streaming=False,
+                finalize=True
+            )
+            flow_elapsed = time.time() - flow_start
+            logging.info(f'[Flow] non-streaming inference: {flow_elapsed:.3f}s')
+            
+            # Apply speed change if requested
+            if speed != 1.0:
+                tts_mel = F.interpolate(tts_mel, size=int(tts_mel.shape[2] / speed), mode='linear')
+            
+            # Hift inference - non-streaming mode
+            hift_start = time.time()
+            tts_speech, _ = self.hift.inference(
+                speech_feat=tts_mel.float(),
+                finalize=True
+            )
+            hift_elapsed = time.time() - hift_start
+            logging.info(f'[HiFT] non-streaming inference: {hift_elapsed:.3f}s')
+        
+        return {'tts_speech': tts_speech.cpu()}

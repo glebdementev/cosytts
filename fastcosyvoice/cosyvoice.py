@@ -73,7 +73,6 @@ class FastCosyVoice3:
         self,
         model_dir: str,
         fp16: bool = True,
-        load_vllm: bool = False,
         load_trt: bool = True,
         load_trt_llm: bool = False,
         trt_concurrent: int = 1,
@@ -88,7 +87,6 @@ class FastCosyVoice3:
         Args:
             model_dir: Path to model directory or ModelScope model ID
             fp16: Whether to use FP16 precision (recommended for speed)
-            load_vllm: Whether to load vLLM for LLM inference (optional)
             load_trt: Whether to load TensorRT for Flow decoder (highly recommended)
             load_trt_llm: Whether to load TensorRT-LLM for LLM (~3x speedup)
             trt_concurrent: Number of concurrent TRT contexts for Flow
@@ -201,10 +199,6 @@ class FastCosyVoice3:
                 max_batch_size=trt_llm_max_batch_size,
                 kv_cache_fraction=trt_llm_kv_cache_fraction,
             )
-        
-        # Optionally load vLLM (alternative to TRT-LLM)
-        if load_vllm and torch.cuda.is_available() and not load_trt_llm:
-            self._load_vllm(model_dir)
         
         del configs
         logging.info(f'FastCosyVoice3 initialized with fp16={fp16}, load_trt={load_trt}, load_trt_llm={load_trt_llm}')
@@ -771,37 +765,6 @@ class FastCosyVoice3:
         finally:
             llm_end_flag['done'] = True
     
-    def _load_vllm(self, model_dir: str):
-        """
-        Load vLLM for accelerated LLM inference.
-        
-        Args:
-            model_dir: Path to model directory
-        """
-        try:
-            from cosyvoice.utils.file_utils import export_cosyvoice2_vllm
-            from vllm import EngineArgs, LLMEngine
-            import threading
-            
-            vllm_path = os.path.join(model_dir, 'vllm')
-            export_cosyvoice2_vllm(self.model.llm, vllm_path, self.model.device)
-            
-            engine_args = EngineArgs(
-                model=vllm_path,
-                skip_tokenizer_init=True,
-                enable_prompt_embeds=True,
-                gpu_memory_utilization=0.5,
-                enable_chunked_prefill=False,
-            )
-            self.model.llm.vllm = LLMEngine.from_engine_args(engine_args)
-            self.model.llm.lock = threading.Lock()
-            del self.model.llm.llm.model.model.layers
-            logging.info('vLLM loaded successfully')
-        except ImportError:
-            logging.warning('vLLM not available, using default LLM inference')
-        except Exception as e:
-            logging.error(f'Failed to load vLLM: {e}', exc_info=True)
-    
     def list_available_spks(self):
         """
         List available speaker IDs.
@@ -945,3 +908,180 @@ class FastCosyVoice3:
                     start_time = time.time()
             
             # Note: model_input tensors freed automatically when out of scope
+    
+    def _run_trt_llm_inference(
+        self,
+        text: str,
+        prompt_text: str,
+        prompt_speech_tokens: list,
+        sampling: int = 25,
+    ) -> list:
+        """
+        Run LLM inference using TRT-LLM (non-streaming).
+        
+        Returns all speech tokens at once after generation completes.
+        
+        Args:
+            text: Text to synthesize
+            prompt_text: Prompt text
+            prompt_speech_tokens: Prompt speech tokens
+            sampling: Top-k sampling parameter
+        
+        Returns:
+            List of speech tokens
+        """
+        # Build input prompt using correct special tokens
+        full_text = prompt_text + text
+        
+        # Convert prompt speech tokens to string format
+        prompt_speech_str = ''.join([f'<|s_{t}|>' for t in prompt_speech_tokens])
+        
+        # Build full prompt with CORRECT special tokens:
+        # <|s_6561|> = sos, <|s_6563|> = task_id
+        sos_token = f'<|s_{self.sos_speech_idx}|>'
+        task_id_token = f'<|s_{self.task_id_speech_idx}|>'
+        prompt = f"{sos_token}{full_text}{task_id_token}{prompt_speech_str}"
+        
+        # Tokenize
+        input_ids = self.trt_llm_tokenizer.encode(prompt)
+        batch_input_ids = [torch.tensor(input_ids, dtype=torch.int32)]
+        input_length = len(input_ids)
+        
+        # Estimate max tokens based on text length
+        estimated_duration_sec = max(5, len(text) / 5)
+        max_speech_tokens = int(estimated_duration_sec * 25 * 1.5)
+        max_new_tokens = min(max_speech_tokens + 100, 2048)
+        
+        logging.debug(f'TRT-LLM: text_len={len(text)}, estimated_duration={estimated_duration_sec:.1f}s, max_new_tokens={max_new_tokens}')
+        
+        # Generate (non-streaming)
+        llm_gen_start = time.time()
+        speech_tokens = []
+        
+        try:
+            with torch.inference_mode():
+                outputs = self.trt_llm_runner.generate(
+                    batch_input_ids=batch_input_ids,
+                    max_new_tokens=max_new_tokens,
+                    end_id=self.eos1_token_id,
+                    pad_id=self.eos1_token_id,
+                    temperature=0.8,
+                    top_k=sampling,
+                    top_p=0.95,
+                    repetition_penalty=1.1,
+                    num_return_sequences=1,
+                    streaming=False,
+                    output_sequence_lengths=True,
+                    output_generation_logits=False,
+                    return_dict=True,
+                )
+                
+                output_ids = outputs["output_ids"]
+                sequence_lengths = outputs["sequence_lengths"]
+                
+                output_end = sequence_lengths[0][0].item()
+                generated_ids = output_ids[0][0][input_length:output_end].tolist()
+                
+                # Extract speech tokens
+                speech_tokens = self._extract_speech_ids(generated_ids)
+        finally:
+            del batch_input_ids
+        
+        llm_gen_elapsed = time.time() - llm_gen_start
+        raw_tps = len(generated_ids) / llm_gen_elapsed if llm_gen_elapsed > 0 else 0
+        speech_tps = len(speech_tokens) / llm_gen_elapsed if llm_gen_elapsed > 0 else 0
+        logging.info(
+            f'TRT-LLM non-streaming: {len(generated_ids)} raw tokens ({raw_tps:.1f}/s), '
+            f'{len(speech_tokens)} speech tokens ({speech_tps:.1f}/s) in {llm_gen_elapsed:.3f}s'
+        )
+        
+        return speech_tokens
+    
+    def inference_zero_shot(
+        self,
+        tts_text: str,
+        prompt_text: str,
+        prompt_wav: str,
+        zero_shot_spk_id: str = '',
+        text_frontend: bool = True,
+        speed: float = 1.0
+    ) -> Generator[Dict[str, torch.Tensor], None, None]:
+        """
+        Zero-shot non-streaming TTS inference.
+        
+        This method generates all speech tokens first, then converts them to audio
+        in one pass. This has higher latency to first audio but can be simpler
+        for batch processing.
+        
+        If TRT-LLM is loaded, uses TensorRT-LLM for LLM inference (~3x faster).
+        
+        Args:
+            tts_text: Text to synthesize
+            prompt_text: Text content of the prompt audio
+            prompt_wav: Path to prompt audio file
+            zero_shot_spk_id: Optional speaker ID (if already registered)
+            text_frontend: Whether to apply text normalization
+            speed: Speech speed multiplier (1.0 = normal)
+        
+        Yields:
+            Dict with 'tts_speech' key containing audio tensor [1, audio_len]
+            (yields one chunk per text segment after normalization/splitting)
+        """
+        # Normalize prompt text
+        prompt_text = self.frontend.text_normalize(
+            prompt_text, split=False, text_frontend=text_frontend
+        )
+        
+        # Process each text chunk
+        for text_chunk in tqdm(
+            self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend),
+            desc='Synthesizing'
+        ):
+            # Warn if text is too short
+            if not hasattr(text_chunk, '__iter__') or isinstance(text_chunk, str):
+                if len(text_chunk) < 0.5 * len(prompt_text):
+                    logging.warning(
+                        f'Synthesis text "{text_chunk}" is shorter than prompt text, '
+                        'this may lead to poor quality'
+                    )
+            
+            # Prepare model input
+            model_input = self.frontend.frontend_zero_shot(
+                text_chunk, prompt_text, prompt_wav, self.sample_rate, zero_shot_spk_id
+            )
+            
+            start_time = time.time()
+            logging.info(f'Synthesizing: {text_chunk}')
+            
+            # Use TRT-LLM if available
+            if self.trt_llm_loaded:
+                prompt_speech_tokens = model_input['llm_prompt_speech_token'].squeeze(0).tolist()
+                
+                # Generate all tokens (non-streaming)
+                speech_tokens = self._run_trt_llm_inference(
+                    text=text_chunk,
+                    prompt_text=prompt_text,
+                    prompt_speech_tokens=prompt_speech_tokens,
+                )
+                
+                # Convert tokens to audio in one pass
+                model_output = self.model.tts_with_external_tokens(
+                    tokens=speech_tokens,
+                    speed=speed,
+                    **{k: v for k, v in model_input.items() if k.startswith('flow') or k.startswith('prompt_speech')}
+                )
+                
+                speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
+                elapsed = time.time() - start_time
+                rtf = elapsed / speech_len if speech_len > 0 else 0
+                logging.info(f'Generated speech len={speech_len:.3f}s, rtf={rtf:.3f}')
+                yield model_output
+            else:
+                # Use PyTorch LLM (non-streaming)
+                model_output = self.model.tts(**model_input, speed=speed)
+                
+                speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
+                elapsed = time.time() - start_time
+                rtf = elapsed / speech_len if speech_len > 0 else 0
+                logging.info(f'Generated speech len={speech_len:.3f}s, rtf={rtf:.3f}')
+                yield model_output

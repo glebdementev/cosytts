@@ -4,7 +4,7 @@
 python cosyvoice/bin/export_onnx_optimized.py \
     --model_dir pretrained_models/Fun-CosyVoice3-0.5B
 
-# Optimized export - no benefits after tests
+# Optimized export - no benefits from flag `--optimize` after tests
 python cosyvoice/bin/export_onnx_optimized.py \
     --model_dir pretrained_models/Fun-CosyVoice3-0.5B \
     --optimize --fp16 --trt

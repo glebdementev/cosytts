@@ -90,8 +90,9 @@ def split_paragraph(text: str, tokenize, lang="zh", token_max_n=80, token_min_n=
     if lang == "zh":
         pounc = ['。', '？', '！', '；', '：', '、', '.', '?', '!', ';', '…']
     elif lang == "ru":
-        # Russian punctuation
-        pounc = ['.', '?', '!', ';', ':', '…']
+        # Russian punctuation (colon excluded: splitting on ":" breaks phrases
+        # like "в пространстве: планете Арракис" into tiny fragments)
+        pounc = ['.', '?', '!', ';', '…']
     else:
         pounc = ['.', '?', '!', ';', ':', '…']
     if comma_split:
@@ -172,6 +173,11 @@ def split_paragraph(text: str, tokenize, lang="zh", token_max_n=80, token_min_n=
                 result_utts[-1] = result_utts[-1] + ' ' + tail
             else:
                 result_utts.append(tail)
+
+    # Strip leading/trailing whitespace from all chunks.
+    # Sentence splitting leaves spaces after punctuation (e.g. ". Следующее"),
+    # and the secondary split path strips them, but the direct path does not.
+    result_utts = [u.strip() for u in result_utts if u.strip()]
 
     return result_utts
 

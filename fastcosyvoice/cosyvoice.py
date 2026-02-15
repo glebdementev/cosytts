@@ -741,22 +741,18 @@ class FastCosyVoice3:
         max_new_tokens = min(max_speech_tokens + 100, 2048)  # Cap at 2048
         
         # Estimate min tokens to prevent premature EOS.
-        # Use TWO estimates and take the max for robustness:
-        # 1. Token-based: text_tokens * 2 (matches PyTorch min_token_text_ratio=2)
-        # 2. Character-based: chars * 1.8 (≈25 speech_tok/s ÷ ~14 chars/s)
-        # The character-based estimate is more reliable for Russian text where
-        # tokenizer tokens are few but actual speech duration is long.
-        # Empirical data: median ratio = 1.68 tok/char, min observed = 1.11.
-        # Using 1.7-1.8 ensures the model generates enough tokens for complete speech
-        # while still allowing natural EOS for texts spoken faster than average.
+        # Token-based: text_tokens * 2 (matches PyTorch min_token_text_ratio=2)
+        # TODO: add character-based estimate for Russian (Qwen2 BPE compresses
+        # Cyrillic heavily, ~2.7 chars/token, so text_tokens*2 covers only ~40%
+        # of actual speech tokens needed). Needs quality measurement first.
+        # min_by_chars = int(len(text) * 1.7)
         text_token_ids = self.trt_llm_tokenizer.encode(text)
         min_by_tokens = len(text_token_ids) * 2
-        min_by_chars = int(len(text) * 1.7)
-        min_new_tokens = max(min_by_tokens, min_by_chars)
+        min_new_tokens = min_by_tokens
         
         logging.debug(
             f'TRT-LLM: text_len={len(text)}, text_tokens={len(text_token_ids)}, '
-            f'min_new_tokens={min_new_tokens} (tok={min_by_tokens}, char={min_by_chars}), '
+            f'min_new_tokens={min_new_tokens} (tok={min_by_tokens}), '
             f'max_new_tokens={max_new_tokens}'
         )
         
@@ -1075,22 +1071,18 @@ class FastCosyVoice3:
         max_new_tokens = min(max_speech_tokens + 100, 2048)
         
         # Estimate min tokens to prevent premature EOS.
-        # Use TWO estimates and take the max for robustness:
-        # 1. Token-based: text_tokens * 2 (matches PyTorch min_token_text_ratio=2)
-        # 2. Character-based: chars * 1.8 (≈25 speech_tok/s ÷ ~14 chars/s)
-        # The character-based estimate is more reliable for Russian text where
-        # tokenizer tokens are few but actual speech duration is long.
-        # Empirical data: median ratio = 1.68 tok/char, min observed = 1.11.
-        # Using 1.7-1.8 ensures the model generates enough tokens for complete speech
-        # while still allowing natural EOS for texts spoken faster than average.
+        # Token-based: text_tokens * 2 (matches PyTorch min_token_text_ratio=2)
+        # TODO: add character-based estimate for Russian (Qwen2 BPE compresses
+        # Cyrillic heavily, ~2.7 chars/token, so text_tokens*2 covers only ~40%
+        # of actual speech tokens needed). Needs quality measurement first.
+        # min_by_chars = int(len(text) * 1.7)
         text_token_ids = self.trt_llm_tokenizer.encode(text)
         min_by_tokens = len(text_token_ids) * 2
-        min_by_chars = int(len(text) * 1.7)
-        min_new_tokens = max(min_by_tokens, min_by_chars)
+        min_new_tokens = min_by_tokens
         
         logging.debug(
             f'TRT-LLM: text_len={len(text)}, text_tokens={len(text_token_ids)}, '
-            f'min_new_tokens={min_new_tokens} (tok={min_by_tokens}, char={min_by_chars}), '
+            f'min_new_tokens={min_new_tokens} (tok={min_by_tokens}), '
             f'max_new_tokens={max_new_tokens}'
         )
         

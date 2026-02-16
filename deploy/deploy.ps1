@@ -110,6 +110,18 @@ Invoke-Step "Normalize deploy scripts line endings" {
   }
 }
 
+Invoke-Step "Ensure Matcha-TTS checkout" {
+  $matchaPath = Join-Path $repoRoot "third_party\Matcha-TTS"
+  if (-not (Test-Path $matchaPath)) {
+    $matchaParent = Split-Path $matchaPath -Parent
+    if (-not (Test-Path $matchaParent)) {
+      New-Item -ItemType Directory -Path $matchaParent | Out-Null
+    }
+    & git clone https://github.com/shivammehta25/Matcha-TTS.git $matchaPath
+    if ($LASTEXITCODE -ne 0) { throw "Failed to clone Matcha-TTS into $matchaPath" }
+  }
+}
+
 Invoke-Step "Create archive" {
   Push-Location $repoRoot
   try {

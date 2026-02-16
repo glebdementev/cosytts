@@ -25,6 +25,12 @@ if [ $stage -le -1 ] && [ $stop_stage -ge -1 ]; then
     cd runtime/triton_trtllm
 fi
 
+if [ ! -d "${cosyvoice_path}/third_party/Matcha-TTS" ]; then
+    echo "Cloning Matcha-TTS into third_party"
+    mkdir -p "${cosyvoice_path}/third_party"
+    git clone https://github.com/shivammehta25/Matcha-TTS.git "${cosyvoice_path}/third_party/Matcha-TTS"
+fi
+
 if [ $stage -le 0 ] && [ $stop_stage -ge 0 ]; then
     echo "Downloading CosyVoice2-0.5B"
     # see https://github.com/nvidia-china-sae/mair-hub/blob/main/rl-tutorial/cosyvoice_llm/pretrained_to_huggingface.py

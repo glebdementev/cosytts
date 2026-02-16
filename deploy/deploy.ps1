@@ -70,7 +70,7 @@ $SshUser = Get-RequiredValue "ssh.user" $cfg.ssh.user
 $SshPort = [int](Get-RequiredValue "ssh.port" $cfg.ssh.port)
 $KeyPath = $cfg.ssh.key_path
 $RemoteDir = Get-RequiredValue "remote.dir" $cfg.remote.dir
-$RemoteComposeFile = "runtime/triton_trtllm/docker-compose.streaming.yml"
+$RemoteComposeFile = "api/docker-compose.streaming.yml"
 
 $target = "${SshUser}@${SshHost}"
 
@@ -158,23 +158,19 @@ Invoke-Step "Verify health endpoint (remote localhost)" {
   Write-Host "Health check failed (remote): $healthUrl"
   Write-Host "Remote compose status:"
   & ssh @sshArgs $target "cd $RemoteDir && docker compose -f $RemoteComposeFile ps"
-  Write-Host "Remote compose logs (tts_api):"
-  & ssh @sshArgs $target "cd $RemoteDir && docker compose -f $RemoteComposeFile logs --tail=200 tts_api"
+  Write-Host "Remote compose logs (api):"
+  & ssh @sshArgs $target "cd $RemoteDir && docker compose -f $RemoteComposeFile logs --tail=200 api"
   throw "Service did not become healthy."
 }
 
 Invoke-Step "Verify streaming synthesis endpoint (remote from local)" {
-  $sourceWavPath = Join-Path $repoRoot "deploy\tts_test.wav"
-  if (-not (Test-Path $sourceWavPath)) {
-    throw "Missing test reference wav: $sourceWavPath"
+  $voiceName = $env:TTS_TEST_VOICE
+  if ([string]::IsNullOrWhiteSpace($voiceName)) {
+    $voiceName = "polina"
   }
-
-  $wavBytes = [IO.File]::ReadAllBytes($sourceWavPath)
-  $wavB64 = [Convert]::ToBase64String($wavBytes)
   $requestBody = @{
     text = "Streaming synthesis test from deploy script."
-    reference_text = "This is the reference text for the deploy verification audio."
-    reference_audio_base64 = $wavB64
+    voice = $voiceName
   } | ConvertTo-Json -Depth 5 -Compress
 
   $requestJsonPath = Join-Path $repoRoot "deploy\_stream_test_request.json"

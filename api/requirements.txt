@@ -1,0 +1,5 @@
+fastapi
+numpy
+soundfile
+tritonclient[grpc]
+uvicorn

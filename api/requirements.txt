@@ -16,6 +16,7 @@ wetext
 transformers
 x-transformers
 silero-stress
+openai-whisper
 inflect
 gdown
 wget

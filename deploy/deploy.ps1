@@ -102,12 +102,6 @@ if (Test-Path $archivePath) { Remove-Item $archivePath -Force }
 Invoke-Step "Normalize deploy scripts line endings" {
   $bootstrapPath = Join-Path $repoRoot "deploy\remote_bootstrap.sh"
   ConvertTo-UnixLineEndings $bootstrapPath
-  $tritonRunPath = Join-Path $repoRoot "runtime\triton_trtllm\run.sh"
-  ConvertTo-UnixLineEndings $tritonRunPath
-  $ditRunPath = Join-Path $repoRoot "runtime\triton_trtllm\run_stepaudio2_dit_token2wav.sh"
-  if (Test-Path $ditRunPath) {
-    ConvertTo-UnixLineEndings $ditRunPath
-  }
 }
 
 Invoke-Step "Ensure Matcha-TTS checkout" {

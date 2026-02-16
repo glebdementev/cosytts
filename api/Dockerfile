@@ -1,14 +1,10 @@
-FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
+FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
 
 WORKDIR /app
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        software-properties-common \
         ffmpeg libsndfile1 git sox build-essential \
-    && add-apt-repository ppa:deadsnakes/ppa \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
         python3.10 python3.10-dev python3.10-venv \
     && rm -rf /var/lib/apt/lists/*
 
@@ -21,8 +17,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && pip install --no-cache-dir -r /app/requirements.txt
 
 COPY api /app/api
+COPY cosyvoice /app/cosyvoice
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONIOENCODING=utf-8
+ENV PYTHONPATH="/app:${PYTHONPATH}"
 
 CMD ["python3.10", "-m", "api.run"]

@@ -19,6 +19,7 @@ services:
       - LOAD_TRT_FLOW=false
       - LOAD_TRT_LLM=false
       - USE_SPK2INFO_CACHE=true
+      - WARMUP_VOICE=polina
     deploy:
       resources:
         reservations:

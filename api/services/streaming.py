@@ -92,10 +92,48 @@ class CosyVoice3StreamingTtsService:
             )
 
         self.sample_rate = int(getattr(self.model, "sample_rate", 24000))
+
+        warmup_voice = os.getenv("WARMUP_VOICE", "")
+        if warmup_voice:
+            self._warmup(warmup_voice)
+
         self.ready = True
 
     def health(self) -> bool:
         return self.model is not None and self.ready
+
+    def _warmup(self, voice: str) -> None:
+        """Run a short inference to trigger CUDA/PyTorch JIT compilation.
+
+        Without this, the first real request pays a ~20-30s cold-start
+        penalty while GPU kernels are compiled on demand.
+        """
+        logger.info("Warmup: running inference with voice=%s ...", voice)
+        t0 = time.perf_counter()
+        try:
+            wav_path, reference_text = self._load_voice_profile(voice)
+            prompt_text = f"{self.instruction}<|endofprompt|>{reference_text}"
+            spk_id = voice if self.use_spk2info_cache else ""
+            self._ensure_voice_registered(prompt_text, wav_path, spk_id)
+
+            warmup_request = StreamingTtsRequest(text="Тест.", voice=voice)
+
+            if self.use_fast_pipeline:
+                gen = self._raw_stream_fast(
+                    warmup_request, prompt_text, wav_path, spk_id, trimmer=None,
+                )
+            else:
+                gen = self._raw_stream_standard(
+                    warmup_request, prompt_text, wav_path, spk_id, trimmer=None,
+                )
+            for _ in gen:
+                pass
+
+            elapsed_s = time.perf_counter() - t0
+            logger.info("Warmup complete in %.1fs", elapsed_s)
+        except Exception:
+            elapsed_s = time.perf_counter() - t0
+            logger.exception("Warmup failed after %.1fs (non-fatal)", elapsed_s)
 
     def _load_voice_profile(self, voice: str) -> tuple[str, str]:
         if "/" in voice or "\\" in voice:

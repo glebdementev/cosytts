@@ -61,7 +61,7 @@ class CosyVoice3StreamingTtsService:
         self.auto_stress = _env_bool("AUTO_STRESS", "false")
         self.use_spk2info_cache = _env_bool("USE_SPK2INFO_CACHE", "true")
         self.trim_leading_silence = _env_bool("TRIM_LEADING_SILENCE", "true")
-        self.silence_threshold = int(os.getenv("SILENCE_THRESHOLD_INT16", "256"))
+        self.silence_threshold = int(os.getenv("SILENCE_THRESHOLD_INT16", "512"))
         self.voices_dir = os.getenv(
             "VOICES_DIR",
             os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "voices")),

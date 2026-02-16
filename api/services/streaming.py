@@ -5,8 +5,9 @@ import os
 import sys
 import threading
 import time
+import queue
 from collections.abc import Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import soundfile as sf
 import torch
@@ -33,7 +34,16 @@ def _env_bool(name: str, default: str) -> bool:
 
 @dataclass
 class _RequestState:
-    registered_voices: set[str]
+    registered_voices: set[str] = field(default_factory=set)
+
+
+@dataclass
+class SynthesisResult:
+    """Eagerly-validated first chunk + lazy remainder stream."""
+
+    stream: Generator[bytes, None, None]
+    ttfb_ms: float
+    attempts: int
 
 
 class CosyVoice3StreamingTtsService:
@@ -58,7 +68,7 @@ class CosyVoice3StreamingTtsService:
         )
 
         torch.set_float32_matmul_precision("high")
-        self._state = _RequestState(registered_voices=set())
+        self._state = _RequestState()
         self._inference_lock = threading.Lock()
         self.ready = False
 
@@ -186,27 +196,81 @@ class CosyVoice3StreamingTtsService:
     # Safe cancellation helpers
     # ------------------------------------------------------------------
 
-    def _drain_generator(self, gen: Generator[bytes, None, None]) -> None:
-        """Consume a generator to completion so model cleanup code runs.
+    def _start_stream_worker(
+        self,
+        gen: Generator[bytes, None, None],
+        cancel_event: threading.Event,
+    ) -> tuple[queue.Queue, threading.Thread, object]:
+        end_sentinel: object = object()
+        output_queue: queue.Queue = queue.Queue()
 
-        CosyVoice3 (non-fast) stores per-request state in UUID-keyed dicts
-        and only cleans them up after the last yield.  Simply closing the
-        generator would skip that cleanup and leak memory.
+        def _run() -> None:
+            try:
+                for chunk in gen:
+                    if cancel_event.is_set():
+                        if self.use_fast_pipeline:
+                            break
+                        # For non-fast pipeline, keep draining for cleanup.
+                        continue
+                    output_queue.put(chunk)
+            except Exception as exc:
+                output_queue.put(exc)
+            finally:
+                if cancel_event.is_set() and self.use_fast_pipeline:
+                    try:
+                        gen.close()
+                    except Exception:
+                        pass
+                output_queue.put(end_sentinel)
 
-        FastCosyVoice3 uses function-local state with daemon threads, so
-        closing is safe, but draining is also harmless.
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        return output_queue, thread, end_sentinel
+
+    def _cancel_failed_attempt(
+        self,
+        cancel_event: threading.Event,
+        worker: threading.Thread,
+        attempt: int,
+    ) -> None:
+        cancel_event.set()
+        if self.use_fast_pipeline:
+            worker.join(timeout=5.0)
+            if worker.is_alive():
+                logger.warning(
+                    "TTS worker still running after cancel on attempt %d",
+                    attempt,
+                )
+            return
+        worker.join()
+
+    def _queue_stream(
+        self,
+        output_queue: queue.Queue,
+        end_sentinel: object,
+    ) -> Generator[bytes, None, None]:
+        while True:
+            item = output_queue.get()
+            if item is end_sentinel:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+    # ------------------------------------------------------------------
+    # Public API — eager first-chunk with TTFB retry
+    # ------------------------------------------------------------------
+
+    def stream_synthesize(self, request: StreamingTtsRequest) -> SynthesisResult:
+        """Start synthesis, eagerly validate TTFB, retry if slow.
+
+        This is NOT a generator — it blocks until the first audio chunk
+        arrives (or all retries are exhausted), so the caller can decide
+        to return an HTTP error before committing a 200 response.
+
+        Returns a SynthesisResult whose .stream() yields audio bytes.
+        Raises RuntimeError if all attempts exceed the TTFB timeout.
         """
-        try:
-            for _ in gen:
-                pass
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # Public API — streaming with TTFB retry
-    # ------------------------------------------------------------------
-
-    def stream_synthesize(self, request: StreamingTtsRequest) -> Generator[bytes, None, None]:
         wav_path, reference_text = self._load_voice_profile(request.voice)
         prompt_text = f"{self.instruction}<|endofprompt|>{reference_text}"
         spk_id = request.voice if self.use_spk2info_cache else ""
@@ -214,17 +278,17 @@ class CosyVoice3StreamingTtsService:
         self._ensure_voice_registered(prompt_text, wav_path, spk_id)
 
         with self._inference_lock:
-            yield from self._stream_with_retries(
+            return self._synthesize_with_retries(
                 request, prompt_text, wav_path, spk_id,
             )
 
-    def _stream_with_retries(
+    def _synthesize_with_retries(
         self,
         request: StreamingTtsRequest,
         prompt_text: str,
         wav_path: str,
         spk_id: str,
-    ) -> Generator[bytes, None, None]:
+    ) -> SynthesisResult:
         for attempt in range(1, MAX_RETRIES + 1):
             trimmer = (
                 LeadingSilenceTrimmer(self.silence_threshold)
@@ -240,52 +304,67 @@ class CosyVoice3StreamingTtsService:
                 gen = self._raw_stream_standard(
                     request, prompt_text, wav_path, spk_id, trimmer,
                 )
+            cancel_event = threading.Event()
+            output_queue, worker, end_sentinel = self._start_stream_worker(gen, cancel_event)
 
-            first_chunk, ttfb_ok = self._await_first_chunk(gen, attempt)
+            t0 = time.perf_counter()
+            try:
+                first_item = output_queue.get(timeout=TTFB_TIMEOUT_S)
+            except queue.Empty:
+                first_item = None
+            elapsed_s = time.perf_counter() - t0
+            ttfb_ms = elapsed_s * 1000.0
 
-            if ttfb_ok and first_chunk is not None:
-                yield first_chunk
-                yield from gen
-                return
+            if first_item is None:
+                logger.error(
+                    "TTS TTFB exceeded %.0fms on attempt %d — retrying",
+                    TTFB_TIMEOUT_S * 1000,
+                    attempt,
+                )
+                self._cancel_failed_attempt(cancel_event, worker, attempt)
+                continue
 
-            # TTFB exceeded — cancel this attempt
-            self._drain_generator(gen)
+            if first_item is end_sentinel:
+                logger.info("TTS produced no audio on attempt %d", attempt)
+                return SynthesisResult(
+                    stream=iter(()),  # type: ignore[arg-type]
+                    ttfb_ms=ttfb_ms,
+                    attempts=attempt,
+                )
+
+            if isinstance(first_item, Exception):
+                raise first_item
+
+            if elapsed_s > TTFB_TIMEOUT_S:
+                logger.error(
+                    "TTS TTFB %.0fms (>%.0fms) on attempt %d — retrying",
+                    ttfb_ms,
+                    TTFB_TIMEOUT_S * 1000,
+                    attempt,
+                )
+                self._cancel_failed_attempt(cancel_event, worker, attempt)
+                continue
+
+            logger.info(
+                "TTS TTFB %.0fms voice=%s (attempt %d)",
+                ttfb_ms, request.voice, attempt,
+            )
+            rest_stream = self._queue_stream(output_queue, end_sentinel)
+            return SynthesisResult(
+                stream=self._chain_stream(first_item, rest_stream),
+                ttfb_ms=ttfb_ms,
+                attempts=attempt,
+            )
 
         raise RuntimeError(
             f"TTS TTFB exceeded {TTFB_TIMEOUT_S:.0f}s on all "
             f"{MAX_RETRIES} attempts for voice={request.voice}"
         )
 
-    def _await_first_chunk(
+    def _chain_stream(
         self,
-        gen: Generator[bytes, None, None],
-        attempt: int,
-    ) -> tuple[bytes | None, bool]:
-        """Pull the first chunk and check TTFB.
-
-        Returns (first_chunk, ttfb_ok).  If the generator is exhausted
-        before yielding anything, returns (None, True) — empty output is
-        not a timeout.
-        """
-        t0 = time.perf_counter()
-
-        first_chunk: bytes | None = None
-        for chunk in gen:
-            first_chunk = chunk
-            break
-
-        elapsed_s = time.perf_counter() - t0
-
-        if first_chunk is None:
-            return None, True
-
-        if elapsed_s > TTFB_TIMEOUT_S:
-            logger.error(
-                "TTS TTFB %.0fms (>%.0fms) on attempt %d — retrying",
-                elapsed_s * 1000,
-                TTFB_TIMEOUT_S * 1000,
-                attempt,
-            )
-            return first_chunk, False
-
-        return first_chunk, True
+        first_item: bytes,
+        rest_stream: Generator[bytes, None, None],
+    ) -> Generator[bytes, None, None]:
+        yield first_item
+        yield from rest_stream

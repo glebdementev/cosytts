@@ -18,6 +18,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 COPY api /app/api
 COPY cosyvoice /app/cosyvoice
+COPY fastcosyvoice /app/fastcosyvoice
+COPY third_party/Matcha-TTS /app/third_party/Matcha-TTS
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONIOENCODING=utf-8

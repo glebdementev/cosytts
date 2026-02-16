@@ -42,7 +42,7 @@ print(f"Using voice profile: {voice_name}")
 
 # Streaming endpoint (real TTFB)
 print("\n" + "=" * 50)
-print("Streaming /synthesize/stream (PCM)")
+print("Streaming /synthesize/stream (save as WAV)")
 print("=" * 50)
 request_body = json.dumps(request_payload).encode("utf-8")
 
@@ -63,19 +63,19 @@ try:
         if first_chunk:
             ttfb_ms = (time.perf_counter() - start_time) * 1000
             print(f"TTFB (streaming): {ttfb_ms:.2f} ms")
-        pcm_audio = first_chunk + response.read()
+        audio_frames = first_chunk + response.read()
 except urllib.error.HTTPError as exc:
     body = exc.read().decode("utf-8", errors="replace")
     fail(f"TTS stream request failed: {exc.code} {exc.reason}. Body: {body}")
 
-if not pcm_audio:
+if not audio_frames:
     fail("Streaming response contained no audio bytes.")
 
 with wave.open(output_path, "wb") as handle:
     handle.setnchannels(channels)
     handle.setsampwidth(sample_width)
     handle.setframerate(sample_rate)
-    handle.writeframes(pcm_audio)
+    handle.writeframes(audio_frames)
 
 size = os.path.getsize(output_path)
 print(f"Stream OK - wrote {size} bytes to {output_path}")

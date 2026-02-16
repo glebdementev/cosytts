@@ -4,6 +4,7 @@ numpy
 soundfile
 torch
 torchaudio
+torchcodec
 modelscope
 hyperpyyaml
 omegaconf
@@ -25,3 +26,4 @@ onnxruntime-gpu
 tqdm
 scipy
 sentencepiece
+pyarrow

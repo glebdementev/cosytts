@@ -33,7 +33,6 @@ from typing import Generator
 import torch
 from tqdm import tqdm
 from hyperpyyaml import load_hyperpyyaml
-from modelscope import snapshot_download
 
 from cosyvoice.utils.file_utils import logging
 from cosyvoice.utils.class_utils import get_model_type
@@ -114,10 +113,11 @@ class FastCosyVoice3:
         self.fp16 = fp16
         self.trt_llm_loaded = False
         
-        # Download model if not exists
-        if not os.path.exists(model_dir):
-            model_dir = snapshot_download(model_id='FunAudioLLM/Fun-CosyVoice3-0.5B-2512', local_dir=model_dir)
-            self.model_dir = model_dir
+        if not os.path.isdir(model_dir):
+            raise FileNotFoundError(
+                f"Model directory does not exist: {model_dir}. "
+                "Download the model first (see README) or check MODEL_DIR."
+            )
         
         # Load config
         hyper_yaml_path = os.path.join(model_dir, 'cosyvoice3.yaml')

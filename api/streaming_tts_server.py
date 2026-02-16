@@ -1,6 +1,7 @@
 import os
 import sys
 import threading
+import logging
 from collections.abc import Generator
 from dataclasses import dataclass
 
@@ -94,8 +95,10 @@ class CosyVoice3StreamingTtsService:
         except Exception as exc:
             raise ValueError(f"Failed to read voice reference audio: {wav_path}") from exc
 
-        if sample_rate != 16000:
-            raise ValueError(f"Voice '{voice}' sample rate must be 16000 Hz, got {sample_rate} Hz")
+        if sample_rate not in (16000, 24000):
+            raise ValueError(
+                f"Voice '{voice}' sample rate must be 16000 or 24000 Hz, got {sample_rate} Hz"
+            )
 
         try:
             with open(txt_path, "r", encoding="utf-8") as handle:
@@ -145,25 +148,38 @@ class CosyVoice3StreamingTtsService:
 
 
 app = FastAPI(title="CosyVoice3 Streaming TTS Server")
+logger = logging.getLogger("cosyvoice3")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
 
 
 @app.on_event("startup")
 def startup() -> None:
-    app.state.service = CosyVoice3StreamingTtsService()
+    app.state.service = None
+    app.state.init_error = None
+    try:
+        app.state.service = CosyVoice3StreamingTtsService()
+    except Exception as exc:
+        app.state.init_error = str(exc)
+        logger.exception("CosyVoice3 service failed to initialize")
 
 
 @app.get("/health", response_model=None)
 def health():  # type: ignore[no-untyped-def]
-    service: CosyVoice3StreamingTtsService = app.state.service
-    if not service.health():
+    if app.state.init_error:
+        return JSONResponse(status_code=503, content={"status": "error", "detail": app.state.init_error})
+    service: CosyVoice3StreamingTtsService | None = app.state.service
+    if service is None or not service.health():
         return JSONResponse(status_code=503, content={"status": "starting"})
     return {"status": "ok"}
 
 
 @app.post("/synthesize/stream")
 def synthesize_stream(request: StreamingTtsRequest) -> StreamingResponse:
-    service: CosyVoice3StreamingTtsService = app.state.service
-    if not service.health():
+    if app.state.init_error:
+        raise HTTPException(status_code=503, detail=app.state.init_error)
+    service: CosyVoice3StreamingTtsService | None = app.state.service
+    if service is None or not service.health():
         raise HTTPException(status_code=503, detail="CosyVoice3 service is not ready.")
 
     try:

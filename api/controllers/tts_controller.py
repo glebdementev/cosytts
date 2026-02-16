@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from api.schemas.tts import StreamingTtsRequest
-from api.services.cosyvoice_streaming_service import CosyVoice3StreamingTtsService
+from api.services.streaming import CosyVoice3StreamingTtsService
 
 logger = logging.getLogger("cosyvoice3")
 

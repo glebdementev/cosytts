@@ -5,7 +5,7 @@ import uvicorn
 
 def main() -> None:
     uvicorn.run(
-        "api.streaming_tts_server:app",
+        "api.server:app",
         host="0.0.0.0",
         port=8090,
         log_level="info",

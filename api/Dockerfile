@@ -9,12 +9,16 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python3.10 -m venv /opt/venv
+ENV VIRTUAL_ENV="/opt/venv"
 ENV PATH="/opt/venv/bin:${PATH}"
+ENV UV_PROJECT_ENVIRONMENT="/opt/venv"
 
-COPY api/requirements.txt /app/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 torch torchaudio torchvision \
-    && pip install --no-cache-dir -r /app/requirements.txt
+    pip install --no-cache-dir uv
+
+COPY pyproject.toml uv.lock /app/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project
 
 COPY api /app/api
 COPY cosyvoice /app/cosyvoice

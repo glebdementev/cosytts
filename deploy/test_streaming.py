@@ -34,7 +34,7 @@ if payload.get("status") != "ok":
     fail(f"Health check failed: {payload}")
 print("Health OK")
 
-test_text = "Privet, ia rabotaiu. Proverka potokovogo TTS."
+test_text = "Я ведаю и веду тебя в замок чтоб повесить на замок."
 voice_name = os.getenv("TTS_TEST_VOICE", "polina")
 
 request_payload = {"text": test_text, "voice": voice_name}

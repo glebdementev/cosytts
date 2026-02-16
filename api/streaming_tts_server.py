@@ -1,17 +1,21 @@
 import os
-import queue
-import uuid
+import sys
+import threading
 from collections.abc import Generator
 from dataclasses import dataclass
-from functools import partial
 
-import numpy as np
 import soundfile as sf
-import tritonclient.grpc as grpcclient
+import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from tritonclient.utils import InferenceServerException, np_to_triton_dtype
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.append(REPO_ROOT)
+sys.path.append(os.path.join(REPO_ROOT, "third_party", "Matcha-TTS"))
+
+from cosyvoice.cli.cosyvoice import CosyVoice3  # noqa: E402
+from fastcosyvoice import FastCosyVoice3  # noqa: E402
 
 
 class StreamingTtsRequest(BaseModel):
@@ -21,37 +25,59 @@ class StreamingTtsRequest(BaseModel):
 
 @dataclass
 class _RequestState:
-    completed_requests: queue.Queue
+    registered_voices: set[str]
 
 
-def _stream_callback(state: _RequestState, result, error) -> None:
-    state.completed_requests.put((result, error))
-
-
-class TritonStreamingTtsService:
+class CosyVoice3StreamingTtsService:
     def __init__(self) -> None:
-        self.server_addr = os.getenv("TRITON_SERVER_ADDR", "localhost:8001")
-        self.model_name = os.getenv("TRITON_MODEL_NAME", "cosyvoice2")
-        self.sample_rate = int(os.getenv("TTS_SAMPLE_RATE", "24000"))
-        self.request_timeout_s = int(os.getenv("TTS_REQUEST_TIMEOUT_S", "300"))
-        self.use_spk2info_cache = os.getenv("USE_SPK2INFO_CACHE", "false").lower() in {"1", "true", "yes"}
+        self.model_dir = os.getenv("MODEL_DIR", "pretrained_models/Fun-CosyVoice3-0.5B")
+        self.use_fast_pipeline = os.getenv("USE_FASTCOSYVOICE3", "true").lower() in {"1", "true", "yes"}
+        self.fp16 = os.getenv("FP16", "true").lower() in {"1", "true", "yes"}
+        self.load_trt_flow = os.getenv("LOAD_TRT_FLOW", "false").lower() in {"1", "true", "yes"}
+        self.load_trt_llm = os.getenv("LOAD_TRT_LLM", "false").lower() in {"1", "true", "yes"}
+        self.trt_llm_dtype = os.getenv("TRT_LLM_DTYPE", "bfloat16")
+        self.trt_llm_kv_cache_tokens = int(os.getenv("TRT_LLM_KV_CACHE_TOKENS", "8192"))
+        self.trt_concurrent = int(os.getenv("TRT_CONCURRENT", "1"))
+        self.instruction = os.getenv("PROMPT_INSTRUCTION", "You are a helpful assistant.")
+        self.text_frontend = os.getenv("TEXT_FRONTEND", "true").lower() in {"1", "true", "yes"}
+        self.auto_stress = os.getenv("AUTO_STRESS", "false").lower() in {"1", "true", "yes"}
+        self.use_spk2info_cache = os.getenv("USE_SPK2INFO_CACHE", "true").lower() in {"1", "true", "yes"}
         self.voices_dir = os.getenv(
             "VOICES_DIR",
             os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "voices")),
         )
 
-    def health(self) -> bool:
-        client = grpcclient.InferenceServerClient(url=self.server_addr, verbose=False)
-        try:
-            return (
-                client.is_server_live()
-                and client.is_server_ready()
-                and client.is_model_ready(self.model_name)
-            )
-        finally:
-            client.close()
+        torch.set_float32_matmul_precision("high")
+        self._state = _RequestState(registered_voices=set())
+        self._inference_lock = threading.Lock()
+        self.ready = False
 
-    def _load_voice_profile(self, voice: str) -> tuple[np.ndarray, str]:
+        if self.use_fast_pipeline:
+            self.model = FastCosyVoice3(
+                model_dir=self.model_dir,
+                fp16=self.fp16,
+                load_trt=self.load_trt_flow,
+                load_trt_llm=self.load_trt_llm,
+                trt_concurrent=self.trt_concurrent,
+                trt_llm_dtype=self.trt_llm_dtype,
+                trt_llm_kv_cache_tokens=self.trt_llm_kv_cache_tokens,
+            )
+        else:
+            self.model = CosyVoice3(
+                model_dir=self.model_dir,
+                fp16=self.fp16,
+                load_trt=self.load_trt_flow,
+                load_vllm=False,
+                trt_concurrent=self.trt_concurrent,
+            )
+
+        self.sample_rate = int(getattr(self.model, "sample_rate", 24000))
+        self.ready = True
+
+    def health(self) -> bool:
+        return self.model is not None and self.ready
+
+    def _load_voice_profile(self, voice: str) -> tuple[str, str]:
         if "/" in voice or "\\" in voice:
             raise ValueError("voice must be a simple name without path separators")
 
@@ -64,15 +90,12 @@ class TritonStreamingTtsService:
             raise ValueError(f"Unknown voice '{voice}': missing {voice}.txt in voices directory")
 
         try:
-            waveform, sample_rate = sf.read(wav_path, dtype="float32")
+            _, sample_rate = sf.read(wav_path, dtype="float32")
         except Exception as exc:
             raise ValueError(f"Failed to read voice reference audio: {wav_path}") from exc
 
         if sample_rate != 16000:
             raise ValueError(f"Voice '{voice}' sample rate must be 16000 Hz, got {sample_rate} Hz")
-
-        if waveform.ndim > 1:
-            waveform = waveform.mean(axis=1)
 
         try:
             with open(txt_path, "r", encoding="utf-8") as handle:
@@ -83,101 +106,55 @@ class TritonStreamingTtsService:
         if not reference_text:
             raise ValueError(f"Voice '{voice}' reference text file is empty: {txt_path}")
 
-        return waveform, reference_text
-
-    def _build_inputs(self, request: StreamingTtsRequest):
-        if self.use_spk2info_cache:
-            target_text = np.array([request.text], dtype=object).reshape((1, 1))
-            text_input = grpcclient.InferInput("target_text", [1, 1], "BYTES")
-            text_input.set_data_from_numpy(target_text)
-            return [text_input]
-
-        waveform, reference_text_raw = self._load_voice_profile(request.voice)
-        waveform = waveform.reshape(1, -1).astype(np.float32)
-        wav_len = np.array([[waveform.shape[1]]], dtype=np.int32)
-
-        reference_text = np.array([reference_text_raw], dtype=object).reshape((1, 1))
-        target_text = np.array([request.text], dtype=object).reshape((1, 1))
-
-        inputs = [
-            grpcclient.InferInput("reference_wav", waveform.shape, np_to_triton_dtype(waveform.dtype)),
-            grpcclient.InferInput("reference_wav_len", wav_len.shape, np_to_triton_dtype(wav_len.dtype)),
-            grpcclient.InferInput("reference_text", [1, 1], "BYTES"),
-            grpcclient.InferInput("target_text", [1, 1], "BYTES"),
-        ]
-        inputs[0].set_data_from_numpy(waveform)
-        inputs[1].set_data_from_numpy(wav_len)
-        inputs[2].set_data_from_numpy(reference_text)
-        inputs[3].set_data_from_numpy(target_text)
-        return inputs
-
-    @staticmethod
-    def _to_pcm16le(chunk: np.ndarray) -> bytes:
-        if chunk is None:
-            return b""
-        mono = np.asarray(chunk).reshape(-1)
-        audio_int16 = np.clip(mono, -1.0, 1.0)
-        audio_int16 = (audio_int16 * 32767.0).astype(np.int16)
-        return audio_int16.tobytes()
+        return wav_path, reference_text
 
     def stream_synthesize(self, request: StreamingTtsRequest) -> Generator[bytes, None, None]:
-        inputs = self._build_inputs(request)
-        outputs = [grpcclient.InferRequestedOutput("waveform")]
-        state = _RequestState(completed_requests=queue.Queue())
-        request_id = str(uuid.uuid4())
+        wav_path, reference_text = self._load_voice_profile(request.voice)
+        prompt_text = f"{self.instruction}<|endofprompt|>{reference_text}"
+        spk_id = request.voice if self.use_spk2info_cache else ""
 
-        client = grpcclient.InferenceServerClient(url=self.server_addr, verbose=False)
-        try:
-            client.start_stream(callback=partial(_stream_callback, state))
-            client.async_stream_infer(
-                self.model_name,
-                inputs,
-                request_id=request_id,
-                outputs=outputs,
-                enable_empty_final_response=True,
-            )
+        if self.use_spk2info_cache and spk_id not in self._state.registered_voices:
+            self.model.add_zero_shot_spk(prompt_text, wav_path, spk_id)
+            self._state.registered_voices.add(spk_id)
 
-            while True:
-                try:
-                    result, error = state.completed_requests.get(timeout=self.request_timeout_s)
-                except queue.Empty as exc:
-                    raise RuntimeError("Timed out waiting for streaming chunk from Triton") from exc
+        with self._inference_lock:
+            if self.use_fast_pipeline:
+                yield from self.model.inference_zero_shot_stream(
+                    tts_text=request.text,
+                    prompt_text=prompt_text,
+                    prompt_wav=wav_path,
+                    zero_shot_spk_id=spk_id,
+                    text_frontend=self.text_frontend,
+                    auto_stress=self.auto_stress,
+                )
+                return
 
-                if error:
-                    if isinstance(error, InferenceServerException):
-                        raise RuntimeError(error.message()) from error
-                    raise RuntimeError(str(error))
-
-                response = result.get_response()
-                final = False
-                params = getattr(response, "parameters", {})
-                if "triton_final_response" in params:
-                    final = params["triton_final_response"].bool_param
-                if final:
-                    break
-
-                chunk = result.as_numpy("waveform")
-                payload = self._to_pcm16le(chunk)
-                if payload:
-                    yield payload
-        finally:
-            try:
-                client.stop_stream()
-            finally:
-                client.close()
+            for model_output in self.model.inference_zero_shot(
+                tts_text=request.text,
+                prompt_text=prompt_text,
+                prompt_wav=wav_path,
+                zero_shot_spk_id=spk_id,
+                stream=True,
+            ):
+                speech = model_output.get("tts_speech")
+                if speech is None:
+                    continue
+                speech = speech.squeeze().clamp(-1.0, 1.0)
+                audio_int16 = (speech * 32767).to(torch.int16)
+                yield audio_int16.cpu().numpy().tobytes()
 
 
-app = FastAPI(title="CosyVoice Triton Streaming TTS Server")
+app = FastAPI(title="CosyVoice3 Streaming TTS Server")
 
 
 @app.on_event("startup")
 def startup() -> None:
-    app.state.service = TritonStreamingTtsService()
+    app.state.service = CosyVoice3StreamingTtsService()
 
 
 @app.get("/health", response_model=None)
 def health():  # type: ignore[no-untyped-def]
-    service: TritonStreamingTtsService = app.state.service
+    service: CosyVoice3StreamingTtsService = app.state.service
     if not service.health():
         return JSONResponse(status_code=503, content={"status": "starting"})
     return {"status": "ok"}
@@ -185,9 +162,9 @@ def health():  # type: ignore[no-untyped-def]
 
 @app.post("/synthesize/stream")
 def synthesize_stream(request: StreamingTtsRequest) -> StreamingResponse:
-    service: TritonStreamingTtsService = app.state.service
+    service: CosyVoice3StreamingTtsService = app.state.service
     if not service.health():
-        raise HTTPException(status_code=503, detail="Triton server is not ready.")
+        raise HTTPException(status_code=503, detail="CosyVoice3 service is not ready.")
 
     try:
         stream = service.stream_synthesize(request)

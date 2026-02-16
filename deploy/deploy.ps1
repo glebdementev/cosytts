@@ -134,6 +134,7 @@ Invoke-Step "Create archive" {
       "--exclude", "__pycache__",
       "--exclude", "deploy.tgz",
       "--exclude", "models",
+      "--exclude", "pretrained_models",
       "--exclude", "*.onnx",
       "--exclude", "*.plan",
       "--exclude", "asr_example",
@@ -151,8 +152,8 @@ Invoke-Step "Create archive" {
 }
 
 Invoke-Step "Prepare remote directory" {
-  # Preserve models directory to avoid re-downloading large model files
-  & ssh @sshArgs $target "find $RemoteDir -mindepth 1 -maxdepth 1 ! -name 'models' -exec rm -rf {} + 2>/dev/null; mkdir -p $RemoteDir"
+  # Preserve model directories to avoid re-downloading large model files
+  & ssh @sshArgs $target "find $RemoteDir -mindepth 1 -maxdepth 1 ! -name 'models' ! -name 'pretrained_models' -exec rm -rf {} + 2>/dev/null; mkdir -p $RemoteDir"
   if ($LASTEXITCODE -ne 0) { throw "ssh mkdir failed" }
 }
 

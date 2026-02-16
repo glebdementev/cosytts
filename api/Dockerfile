@@ -1,17 +1,28 @@
-FROM python:3.10-slim
+FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
 
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libsndfile1 \
+    && apt-get install -y --no-install-recommends \
+        software-properties-common \
+        ffmpeg libsndfile1 git sox build-essential \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3.10 python3.10-dev python3.10-venv \
     && rm -rf /var/lib/apt/lists/*
 
+RUN python3.10 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
 COPY api/requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 torch torchaudio torchvision \
+    && pip install --no-cache-dir -r /app/requirements.txt
 
 COPY api /app/api
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONIOENCODING=utf-8
 
-CMD ["python", "-m", "api.run"]
+CMD ["python3.10", "-m", "api.run"]

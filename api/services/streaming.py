@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
+import time
 from collections.abc import Generator
 from dataclasses import dataclass
 
@@ -18,6 +20,11 @@ sys.path.append(os.path.join(REPO_ROOT, "third_party", "Matcha-TTS"))
 
 from cosyvoice.cli.cosyvoice import CosyVoice3  # noqa: E402
 from fastcosyvoice import FastCosyVoice3  # noqa: E402
+
+logger = logging.getLogger("cosyvoice3")
+
+MAX_RETRIES = 3
+TTFB_TIMEOUT_S = 1.0
 
 
 def _env_bool(name: str, default: str) -> bool:
@@ -113,54 +120,172 @@ class CosyVoice3StreamingTtsService:
 
         return wav_path, reference_text
 
-    def stream_synthesize(self, request: StreamingTtsRequest) -> Generator[bytes, None, None]:
-        wav_path, reference_text = self._load_voice_profile(request.voice)
-        prompt_text = f"{self.instruction}<|endofprompt|>{reference_text}"
-        spk_id = request.voice if self.use_spk2info_cache else ""
-        trimmer = LeadingSilenceTrimmer(self.silence_threshold) if self.trim_leading_silence else None
-
+    def _ensure_voice_registered(self, prompt_text: str, wav_path: str, spk_id: str) -> None:
         if self.use_spk2info_cache and spk_id not in self._state.registered_voices:
             self.model.add_zero_shot_spk(prompt_text, wav_path, spk_id)
             self._state.registered_voices.add(spk_id)
 
-        with self._inference_lock:
-            if self.use_fast_pipeline:
-                for chunk in self.model.inference_zero_shot_stream(
-                    tts_text=request.text,
-                    prompt_text=prompt_text,
-                    prompt_wav=wav_path,
-                    zero_shot_spk_id=spk_id,
-                    text_frontend=self.text_frontend,
-                    auto_stress=self.auto_stress,
-                ):
-                    chunk_bytes = coerce_pcm_bytes(chunk)
-                    if trimmer is None:
-                        if chunk_bytes:
-                            yield chunk_bytes
-                        continue
+    # ------------------------------------------------------------------
+    # Raw inference generators (no retry, no TTFB check)
+    # ------------------------------------------------------------------
 
-                    trimmed = trimmer.process(chunk_bytes)
-                    if trimmed:
-                        yield trimmed
+    def _raw_stream_fast(
+        self,
+        request: StreamingTtsRequest,
+        prompt_text: str,
+        wav_path: str,
+        spk_id: str,
+        trimmer: LeadingSilenceTrimmer | None,
+    ) -> Generator[bytes, None, None]:
+        for chunk in self.model.inference_zero_shot_stream(
+            tts_text=request.text,
+            prompt_text=prompt_text,
+            prompt_wav=wav_path,
+            zero_shot_spk_id=spk_id,
+            text_frontend=self.text_frontend,
+            auto_stress=self.auto_stress,
+        ):
+            chunk_bytes = coerce_pcm_bytes(chunk)
+            if trimmer is None:
+                if chunk_bytes:
+                    yield chunk_bytes
+                continue
+            trimmed = trimmer.process(chunk_bytes)
+            if trimmed:
+                yield trimmed
+
+    def _raw_stream_standard(
+        self,
+        request: StreamingTtsRequest,
+        prompt_text: str,
+        wav_path: str,
+        spk_id: str,
+        trimmer: LeadingSilenceTrimmer | None,
+    ) -> Generator[bytes, None, None]:
+        for model_output in self.model.inference_zero_shot(
+            tts_text=request.text,
+            prompt_text=prompt_text,
+            prompt_wav=wav_path,
+            zero_shot_spk_id=spk_id,
+            stream=True,
+        ):
+            speech = model_output.get("tts_speech")
+            if speech is None:
+                continue
+            speech = speech.squeeze().clamp(-1.0, 1.0)
+            audio_int16 = (speech * 32767).to(torch.int16)
+            chunk = audio_int16.cpu().numpy().tobytes()
+            if trimmer is None:
+                yield chunk
+                continue
+            trimmed = trimmer.process(chunk)
+            if trimmed:
+                yield trimmed
+
+    # ------------------------------------------------------------------
+    # Safe cancellation helpers
+    # ------------------------------------------------------------------
+
+    def _drain_generator(self, gen: Generator[bytes, None, None]) -> None:
+        """Consume a generator to completion so model cleanup code runs.
+
+        CosyVoice3 (non-fast) stores per-request state in UUID-keyed dicts
+        and only cleans them up after the last yield.  Simply closing the
+        generator would skip that cleanup and leak memory.
+
+        FastCosyVoice3 uses function-local state with daemon threads, so
+        closing is safe, but draining is also harmless.
+        """
+        try:
+            for _ in gen:
+                pass
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Public API — streaming with TTFB retry
+    # ------------------------------------------------------------------
+
+    def stream_synthesize(self, request: StreamingTtsRequest) -> Generator[bytes, None, None]:
+        wav_path, reference_text = self._load_voice_profile(request.voice)
+        prompt_text = f"{self.instruction}<|endofprompt|>{reference_text}"
+        spk_id = request.voice if self.use_spk2info_cache else ""
+
+        self._ensure_voice_registered(prompt_text, wav_path, spk_id)
+
+        with self._inference_lock:
+            yield from self._stream_with_retries(
+                request, prompt_text, wav_path, spk_id,
+            )
+
+    def _stream_with_retries(
+        self,
+        request: StreamingTtsRequest,
+        prompt_text: str,
+        wav_path: str,
+        spk_id: str,
+    ) -> Generator[bytes, None, None]:
+        for attempt in range(1, MAX_RETRIES + 1):
+            trimmer = (
+                LeadingSilenceTrimmer(self.silence_threshold)
+                if self.trim_leading_silence
+                else None
+            )
+
+            if self.use_fast_pipeline:
+                gen = self._raw_stream_fast(
+                    request, prompt_text, wav_path, spk_id, trimmer,
+                )
+            else:
+                gen = self._raw_stream_standard(
+                    request, prompt_text, wav_path, spk_id, trimmer,
+                )
+
+            first_chunk, ttfb_ok = self._await_first_chunk(gen, attempt)
+
+            if ttfb_ok and first_chunk is not None:
+                yield first_chunk
+                yield from gen
                 return
 
-            for model_output in self.model.inference_zero_shot(
-                tts_text=request.text,
-                prompt_text=prompt_text,
-                prompt_wav=wav_path,
-                zero_shot_spk_id=spk_id,
-                stream=True,
-            ):
-                speech = model_output.get("tts_speech")
-                if speech is None:
-                    continue
-                speech = speech.squeeze().clamp(-1.0, 1.0)
-                audio_int16 = (speech * 32767).to(torch.int16)
-                chunk = audio_int16.cpu().numpy().tobytes()
-                if trimmer is None:
-                    yield chunk
-                    continue
+            # TTFB exceeded — cancel this attempt
+            self._drain_generator(gen)
 
-                trimmed = trimmer.process(chunk)
-                if trimmed:
-                    yield trimmed
+        raise RuntimeError(
+            f"TTS TTFB exceeded {TTFB_TIMEOUT_S:.0f}s on all "
+            f"{MAX_RETRIES} attempts for voice={request.voice}"
+        )
+
+    def _await_first_chunk(
+        self,
+        gen: Generator[bytes, None, None],
+        attempt: int,
+    ) -> tuple[bytes | None, bool]:
+        """Pull the first chunk and check TTFB.
+
+        Returns (first_chunk, ttfb_ok).  If the generator is exhausted
+        before yielding anything, returns (None, True) — empty output is
+        not a timeout.
+        """
+        t0 = time.perf_counter()
+
+        first_chunk: bytes | None = None
+        for chunk in gen:
+            first_chunk = chunk
+            break
+
+        elapsed_s = time.perf_counter() - t0
+
+        if first_chunk is None:
+            return None, True
+
+        if elapsed_s > TTFB_TIMEOUT_S:
+            logger.error(
+                "TTS TTFB %.0fms (>%.0fms) on attempt %d — retrying",
+                elapsed_s * 1000,
+                TTFB_TIMEOUT_S * 1000,
+                attempt,
+            )
+            return first_chunk, False
+
+        return first_chunk, True

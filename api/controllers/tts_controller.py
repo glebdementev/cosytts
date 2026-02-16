@@ -42,7 +42,7 @@ def synthesize_stream_response(
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    wrapped_stream = _stream_with_ttfb(
+    wrapped_stream = _stream_with_ttfb_log(
         stream=stream,
         request_started_at=request_started_at,
         voice=request.voice,
@@ -59,7 +59,7 @@ def synthesize_stream_response(
     )
 
 
-def _stream_with_ttfb(
+def _stream_with_ttfb_log(
     stream: Generator[bytes, None, None],
     request_started_at: float,
     voice: str,

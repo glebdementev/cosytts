@@ -14,3 +14,4 @@ tritonclient
 modelscope
 fastapi
 uvicorn
+matcha-tts

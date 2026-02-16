@@ -1,5 +1,3 @@
-import base64
-import io
 import os
 import queue
 import uuid
@@ -18,8 +16,7 @@ from tritonclient.utils import InferenceServerException, np_to_triton_dtype
 
 class StreamingTtsRequest(BaseModel):
     text: str = Field(..., min_length=1)
-    reference_text: str = ""
-    reference_audio_base64: str | None = None
+    voice: str = Field(..., min_length=1)
 
 
 @dataclass
@@ -38,6 +35,10 @@ class TritonStreamingTtsService:
         self.sample_rate = int(os.getenv("TTS_SAMPLE_RATE", "24000"))
         self.request_timeout_s = int(os.getenv("TTS_REQUEST_TIMEOUT_S", "300"))
         self.use_spk2info_cache = os.getenv("USE_SPK2INFO_CACHE", "false").lower() in {"1", "true", "yes"}
+        self.voices_dir = os.getenv(
+            "VOICES_DIR",
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "voices")),
+        )
 
     def health(self) -> bool:
         client = grpcclient.InferenceServerClient(url=self.server_addr, verbose=False)
@@ -50,23 +51,39 @@ class TritonStreamingTtsService:
         finally:
             client.close()
 
-    def _decode_reference_audio(self, encoded_audio: str) -> np.ndarray:
-        try:
-            raw = base64.b64decode(encoded_audio, validate=True)
-        except Exception as exc:
-            raise ValueError("reference_audio_base64 is not valid base64") from exc
+    def _load_voice_profile(self, voice: str) -> tuple[np.ndarray, str]:
+        if "/" in voice or "\\" in voice:
+            raise ValueError("voice must be a simple name without path separators")
+
+        wav_path = os.path.join(self.voices_dir, f"{voice}.wav")
+        txt_path = os.path.join(self.voices_dir, f"{voice}.txt")
+
+        if not os.path.exists(wav_path):
+            raise ValueError(f"Unknown voice '{voice}': missing {voice}.wav in voices directory")
+        if not os.path.exists(txt_path):
+            raise ValueError(f"Unknown voice '{voice}': missing {voice}.txt in voices directory")
 
         try:
-            waveform, sample_rate = sf.read(io.BytesIO(raw), dtype="float32")
+            waveform, sample_rate = sf.read(wav_path, dtype="float32")
         except Exception as exc:
-            raise ValueError("reference_audio_base64 is not a valid audio file") from exc
+            raise ValueError(f"Failed to read voice reference audio: {wav_path}") from exc
 
         if sample_rate != 16000:
-            raise ValueError("reference audio sample rate must be 16000 Hz")
+            raise ValueError(f"Voice '{voice}' sample rate must be 16000 Hz, got {sample_rate} Hz")
 
         if waveform.ndim > 1:
             waveform = waveform.mean(axis=1)
-        return waveform
+
+        try:
+            with open(txt_path, "r", encoding="utf-8") as handle:
+                reference_text = handle.read().strip()
+        except OSError as exc:
+            raise ValueError(f"Failed to read voice reference text: {txt_path}") from exc
+
+        if not reference_text:
+            raise ValueError(f"Voice '{voice}' reference text file is empty: {txt_path}")
+
+        return waveform, reference_text
 
     def _build_inputs(self, request: StreamingTtsRequest):
         if self.use_spk2info_cache:
@@ -75,14 +92,11 @@ class TritonStreamingTtsService:
             text_input.set_data_from_numpy(target_text)
             return [text_input]
 
-        if not request.reference_audio_base64:
-            raise ValueError("reference_audio_base64 is required when USE_SPK2INFO_CACHE=false")
-
-        waveform = self._decode_reference_audio(request.reference_audio_base64)
+        waveform, reference_text_raw = self._load_voice_profile(request.voice)
         waveform = waveform.reshape(1, -1).astype(np.float32)
         wav_len = np.array([[waveform.shape[1]]], dtype=np.int32)
 
-        reference_text = np.array([request.reference_text], dtype=object).reshape((1, 1))
+        reference_text = np.array([reference_text_raw], dtype=object).reshape((1, 1))
         target_text = np.array([request.text], dtype=object).reshape((1, 1))
 
         inputs = [

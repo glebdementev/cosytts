@@ -1,0 +1,11 @@
+{
+  "ssh": {
+    "host": "141.105.69.224",
+    "user": "root",
+    "port": 22,
+    "key_path": "~/.ssh/id_rsa"
+  },
+  "remote": {
+    "dir": "/opt/tai-tts"
+  }
+}

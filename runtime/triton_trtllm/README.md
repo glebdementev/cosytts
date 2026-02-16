@@ -144,3 +144,35 @@ bash test/test_cosyvoice.sh
 
 This work originates from the NVIDIA CISI project. For more multimodal resources, please see [mair-hub](https://github.com/nvidia-china-sae/mair-hub).
 
+### Streaming-Only HTTP Service (Health + Streaming Synthesis)
+
+This repo also provides a minimal FastAPI bridge that exposes only:
+- `GET /health`
+- `POST /synthesize/stream`
+
+It is implemented in `streaming_tts_server.py` and uses Triton gRPC decoupled streaming under the hood.
+
+Start both Triton and the streaming API with:
+```sh
+docker compose -f docker-compose.streaming.yml up
+```
+
+The API is exposed on port `8090`.
+
+Example request (JSON):
+```sh
+curl -X POST "http://localhost:8090/synthesize/stream" \
+  -H "Content-Type: application/json" \
+  --data '{
+    "text": "你好，这是一个流式语音合成测试。",
+    "reference_text": "你好，这是参考音频对应的文本。",
+    "reference_audio_base64": "<base64_encoded_wav_16k>"
+  }' \
+  --output out.pcm
+```
+
+By default, the service requires reference audio/text. To run with cached speaker-only input, set:
+```sh
+USE_SPK2INFO_CACHE=true
+```
+In this mode, only `text` is required in the request body.

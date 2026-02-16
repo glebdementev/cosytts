@@ -1,0 +1,39 @@
+services:
+  tts:
+    image: soar97/triton-cosyvoice:25.06
+    shm_size: "1gb"
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+      - "8002:8002"
+    environment:
+      - PYTHONIOENCODING=utf-8
+      - MODEL_ID=${MODEL_ID}
+    volumes:
+      - ../..:/workspace/CosyVoice
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    command: >
+      /bin/bash -c "pip install modelscope && cd /workspace/CosyVoice/runtime/triton_trtllm && bash run.sh 0 3"
+
+  tts_api:
+    image: soar97/triton-cosyvoice:25.06
+    depends_on:
+      - tts
+    ports:
+      - "8090:8090"
+    volumes:
+      - ../..:/workspace/CosyVoice
+    environment:
+      - PYTHONIOENCODING=utf-8
+      - TRITON_SERVER_ADDR=tts:8001
+      - TRITON_MODEL_NAME=cosyvoice2
+      - TTS_SAMPLE_RATE=24000
+      - USE_SPK2INFO_CACHE=false
+    command: >
+      /bin/bash -c "pip install modelscope fastapi uvicorn && cd /workspace/CosyVoice/runtime/triton_trtllm && uvicorn streaming_tts_server:app --host 0.0.0.0 --port 8090"

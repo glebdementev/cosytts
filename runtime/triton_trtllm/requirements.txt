@@ -12,3 +12,5 @@ pyworld
 openai-whisper
 tritonclient
 modelscope
+fastapi
+uvicorn

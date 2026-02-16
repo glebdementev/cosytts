@@ -71,6 +71,10 @@ $SshPort = [int](Get-RequiredValue "ssh.port" $cfg.ssh.port)
 $KeyPath = $cfg.ssh.key_path
 $RemoteDir = Get-RequiredValue "remote.dir" $cfg.remote.dir
 $RemoteComposeFile = "api/docker-compose.streaming.yml"
+$ApiPort = $env:TTS_API_PORT
+if ([string]::IsNullOrWhiteSpace($ApiPort)) {
+  $ApiPort = "8093"
+}
 
 $target = "${SshUser}@${SshHost}"
 
@@ -146,7 +150,7 @@ Invoke-Step "Extract and bootstrap on remote (may take a while)" {
 }
 
 Invoke-Step "Verify health endpoint (remote localhost)" {
-  $healthUrl = "http://localhost:8090/health"
+  $healthUrl = "http://localhost:${ApiPort}/health"
   for ($attempt = 1; $attempt -le 20; $attempt++) {
     $response = & ssh @sshArgs $target "curl -fsS $healthUrl"
     if ($LASTEXITCODE -eq 0 -and $response -match '"status"\s*:\s*"ok"') {
@@ -182,7 +186,7 @@ Invoke-Step "Verify streaming synthesis endpoint (remote from local)" {
       Remove-Item $outputPcmPath -Force
     }
 
-    $streamUrl = "http://${SshHost}:8090/synthesize/stream"
+    $streamUrl = "http://${SshHost}:${ApiPort}/synthesize/stream"
     & curl.exe -fsS `
       -X POST $streamUrl `
       -H "Content-Type: application/json" `

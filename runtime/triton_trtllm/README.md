@@ -157,11 +157,11 @@ Start both Triton and the streaming API with:
 docker compose -f api/docker-compose.streaming.yml up
 ```
 
-The API is exposed on port `8090`.
+The API is exposed on port `8093` by default (override with `TTS_API_PORT`).
 
 Example request (JSON):
 ```sh
-curl -X POST "http://localhost:8090/synthesize/stream" \
+curl -X POST "http://localhost:8093/synthesize/stream" \
   -H "Content-Type: application/json" \
   --data '{
     "text": "你好，这是一个流式语音合成测试。",

@@ -17,7 +17,8 @@ ${COMPOSE_CMD[@]} ps -a
 echo "Container logs (last 50 lines):"
 ${COMPOSE_CMD[@]} logs --tail=50 api || true
 
-HEALTH_URL="http://localhost:8090/health"
+API_PORT="${TTS_API_PORT:-8093}"
+HEALTH_URL="http://localhost:${API_PORT}/health"
 HEALTH_RETRIES=20
 HEALTH_DELAY=30
 
@@ -43,6 +44,6 @@ for attempt in $(seq 1 "${HEALTH_RETRIES}"); do
 done
 
 echo "OK"
-echo "Health:  http://<host>:8090/health"
-echo "TTS:     http://<host>:8090/synthesize/stream"
+echo "Health:  http://<host>:${API_PORT}/health"
+echo "TTS:     http://<host>:${API_PORT}/synthesize/stream"
 echo "Remote bootstrap complete."

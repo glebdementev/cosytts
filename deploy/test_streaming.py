@@ -19,8 +19,9 @@ with open(config_path, "r", encoding="utf-8") as handle:
     cfg = json.load(handle)
 
 host = cfg["ssh"]["host"]
+port = int(os.getenv("TTS_API_PORT", "8093"))
 
-base_url = f"http://{host}:8090"
+base_url = f"http://{host}:{port}"
 health_url = f"{base_url}/health"
 tts_stream_url = f"{base_url}/synthesize/stream"
 

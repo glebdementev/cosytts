@@ -82,14 +82,30 @@ class FastCosyVoice3Model:
             load_llm: If False, skip loading/moving the PyTorch LLM to GPU.
                 Useful when using TRT-LLM (LLM runs outside PyTorch), to reduce VRAM usage.
         """
+        def _extract_state_dict(ckpt_path: str) -> Dict[str, torch.Tensor]:
+            payload = torch.load(ckpt_path, map_location=self.device)
+            if not isinstance(payload, dict):
+                raise ValueError(f'Checkpoint must be a dict: {ckpt_path}')
+
+            for nested_key in ('state_dict', 'model', 'module'):
+                nested = payload.get(nested_key)
+                if isinstance(nested, dict) and any(isinstance(v, torch.Tensor) for v in nested.values()):
+                    payload = nested
+                    break
+
+            state_dict = {k: v for k, v in payload.items() if isinstance(v, torch.Tensor)}
+            if not state_dict:
+                raise ValueError(f'No tensor weights found in checkpoint: {ckpt_path}')
+            return state_dict
+
         if load_llm:
-            self.llm.load_state_dict(torch.load(llm_model, map_location=self.device), strict=True)
+            self.llm.load_state_dict(_extract_state_dict(llm_model), strict=True)
             self.llm.to(self.device)
             if self.fp16:
                 self.llm.half()
             self.llm.eval()
 
-        self.flow.load_state_dict(torch.load(flow_model, map_location=self.device), strict=True)
+        self.flow.load_state_dict(_extract_state_dict(flow_model), strict=True)
         self.flow.to(self.device)
         if self.fp16:
             self.flow.half()
@@ -97,7 +113,7 @@ class FastCosyVoice3Model:
         
         hift_state_dict = {
             k.replace('generator.', ''): v 
-            for k, v in torch.load(hift_model, map_location=self.device).items()
+            for k, v in _extract_state_dict(hift_model).items()
         }
         self.hift.load_state_dict(hift_state_dict, strict=True)
         self.hift.to(self.device).eval()

@@ -62,18 +62,34 @@ class CosyVoiceModel:
         self.hift_cache_dict = {}
 
     def load(self, llm_model, flow_model, hift_model):
-        self.llm.load_state_dict(torch.load(llm_model, map_location=self.device), strict=True)
+        def _extract_state_dict(ckpt_path):
+            payload = torch.load(ckpt_path, map_location=self.device)
+            if not isinstance(payload, dict):
+                raise ValueError('checkpoint must be a dict: {}'.format(ckpt_path))
+            for nested_key in ('state_dict', 'model', 'module'):
+                nested = payload.get(nested_key)
+                if isinstance(nested, dict) and any(isinstance(v, torch.Tensor) for v in nested.values()):
+                    payload = nested
+                    break
+            state_dict = {k: v for k, v in payload.items() if isinstance(v, torch.Tensor)}
+            if not state_dict:
+                raise ValueError('no tensor weights found in checkpoint: {}'.format(ckpt_path))
+            return state_dict
+
+        self.llm.load_state_dict(_extract_state_dict(llm_model), strict=True)
         self.llm.to(self.device)
         if self.fp16:
             self.llm.half()
         self.llm.eval()
-        self.flow.load_state_dict(torch.load(flow_model, map_location=self.device), strict=True)
+        self.flow.load_state_dict(_extract_state_dict(flow_model), strict=True)
         self.flow.to(self.device)
         if self.fp16:
             self.flow.half()
         self.flow.eval()
         # in case hift_model is a hifigan model
-        hift_state_dict = {k.replace('generator.', ''): v for k, v in torch.load(hift_model, map_location=self.device).items()}
+        hift_state_dict = {
+            k.replace('generator.', ''): v for k, v in _extract_state_dict(hift_model).items()
+        }
         self.hift.load_state_dict(hift_state_dict, strict=True)
         self.hift.to(self.device).eval()
 

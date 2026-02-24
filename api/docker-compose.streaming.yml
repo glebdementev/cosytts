@@ -9,10 +9,13 @@ services:
     volumes:
       - ../voices:/voices:ro
       - ../pretrained_models:/models
+      - /root/cosy_finetuned:/finetuned:ro
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - MODEL_DIR=/models/Fun-CosyVoice3-0.5B
+      - LLM_MODEL_PATH=/finetuned/llm/epoch_4_whole_saved.pt
+      - FLOW_MODEL_PATH=/finetuned/flow/epoch_4_whole_saved.pt
       - VOICES_DIR=/voices
       - USE_FASTCOSYVOICE3=true
       - FP16=true

@@ -86,6 +86,9 @@ class FastCosyVoice3:
     def __init__(
         self,
         model_dir: str,
+        llm_model_path: str | None = None,
+        flow_model_path: str | None = None,
+        hift_model_path: str | None = None,
         fp16: bool = True,
         load_trt: bool = True,
         load_trt_llm: bool = False,
@@ -100,6 +103,9 @@ class FastCosyVoice3:
         
         Args:
             model_dir: Path to model directory or ModelScope model ID
+            llm_model_path: Optional absolute/relative path to LLM .pt checkpoint
+            flow_model_path: Optional absolute/relative path to Flow .pt checkpoint
+            hift_model_path: Optional absolute/relative path to HiFT .pt checkpoint
             fp16: Whether to use FP16 precision (recommended for speed)
             load_trt: Whether to load TensorRT for Flow decoder (highly recommended)
             load_trt_llm: Whether to load TensorRT-LLM for LLM (~3x speedup)
@@ -170,9 +176,17 @@ class FastCosyVoice3:
             fp16
         )
 
-        llm_pt_path = os.path.join(model_dir, 'llm.pt')
-        flow_pt_path = os.path.join(model_dir, 'flow.pt')
-        hift_pt_path = os.path.join(model_dir, 'hift.pt')
+        llm_pt_path = llm_model_path or os.path.join(model_dir, 'llm.pt')
+        flow_pt_path = flow_model_path or os.path.join(model_dir, 'flow.pt')
+        hift_pt_path = hift_model_path or os.path.join(model_dir, 'hift.pt')
+
+        for name, path in (
+            ('LLM', llm_pt_path),
+            ('Flow', flow_pt_path),
+            ('HiFT', hift_pt_path),
+        ):
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f'{name} checkpoint not found: {path}')
 
         # If TRT-LLM artifacts already exist, we can skip loading PyTorch LLM to GPU entirely.
         # This avoids a large, unnecessary VRAM allocation (TRT-LLM handles LLM inference).

@@ -49,6 +49,9 @@ class SynthesisResult:
 class CosyVoice3StreamingTtsService:
     def __init__(self) -> None:
         self.model_dir = os.getenv("MODEL_DIR", "pretrained_models/Fun-CosyVoice3-0.5B")
+        self.llm_model_path = os.getenv("LLM_MODEL_PATH", "")
+        self.flow_model_path = os.getenv("FLOW_MODEL_PATH", "")
+        self.hift_model_path = os.getenv("HIFT_MODEL_PATH", "")
         self.use_fast_pipeline = _env_bool("USE_FASTCOSYVOICE3", "true")
         self.fp16 = _env_bool("FP16", "true")
         self.load_trt_flow = _env_bool("LOAD_TRT_FLOW", "false")
@@ -75,6 +78,9 @@ class CosyVoice3StreamingTtsService:
         if self.use_fast_pipeline:
             self.model = FastCosyVoice3(
                 model_dir=self.model_dir,
+                llm_model_path=self.llm_model_path or None,
+                flow_model_path=self.flow_model_path or None,
+                hift_model_path=self.hift_model_path or None,
                 fp16=self.fp16,
                 load_trt=self.load_trt_flow,
                 load_trt_llm=self.load_trt_llm,
@@ -85,6 +91,9 @@ class CosyVoice3StreamingTtsService:
         else:
             self.model = CosyVoice3(
                 model_dir=self.model_dir,
+                llm_model_path=self.llm_model_path or None,
+                flow_model_path=self.flow_model_path or None,
+                hift_model_path=self.hift_model_path or None,
                 fp16=self.fp16,
                 load_trt=self.load_trt_flow,
                 load_vllm=False,

@@ -175,8 +175,8 @@ Invoke-Step "Verify health endpoint (remote localhost)" {
   Write-Host "Health check failed (remote): $healthUrl"
   Write-Host "Remote compose status:"
   & ssh @sshArgs $target "cd $RemoteDir && docker compose -f $RemoteComposeFile ps"
-  Write-Host "Remote compose logs (api):"
-  & ssh @sshArgs $target "cd $RemoteDir && docker compose -f $RemoteComposeFile logs --tail=200 api"
+  Write-Host "Remote compose logs:"
+  & ssh @sshArgs $target "cd $RemoteDir && docker compose -f $RemoteComposeFile logs --tail=200 api-tts-1 api-tts-2 nginx"
   throw "Service did not become healthy."
 }
 

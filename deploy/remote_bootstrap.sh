@@ -85,7 +85,7 @@ sleep 2
 echo "Container status:"
 ${COMPOSE_CMD[@]} ps -a
 echo "Container logs (last 50 lines):"
-${COMPOSE_CMD[@]} logs --tail=50 api || true
+${COMPOSE_CMD[@]} logs --tail=50 api-tts-1 api-tts-2 nginx || true
 
 # ── 3. Health check ──────────────────────────────────────────────────────────
 API_PORT="${TTS_API_PORT:-8093}"
@@ -108,13 +108,18 @@ for attempt in $(seq 1 "${HEALTH_RETRIES}"); do
   if [[ "${attempt}" -eq "${HEALTH_RETRIES}" ]]; then
     echo "ERROR: health check failed after ${HEALTH_RETRIES} attempts." >&2
     ${COMPOSE_CMD[@]} ps
-    ${COMPOSE_CMD[@]} logs --tail=200 api || true
+    ${COMPOSE_CMD[@]} logs --tail=200 api-tts-1 api-tts-2 nginx || true
     exit 1
   fi
   sleep "${HEALTH_DELAY}"
 done
 
 echo "OK"
-echo "Health:  http://<host>:${API_PORT}/health"
+echo ""
+echo "Individual container status:"
+${COMPOSE_CMD[@]} ps api-tts-1 api-tts-2
+echo ""
+echo "Health:  http://<host>:${API_PORT}/health  (nginx → round-robin)"
 echo "TTS:     http://<host>:${API_PORT}/synthesize/stream"
+echo "Direct:  http://<host>:8094 (tts-1)  http://<host>:8095 (tts-2)"
 echo "Remote bootstrap complete."

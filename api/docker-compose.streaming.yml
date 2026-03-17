@@ -1,38 +1,67 @@
+x-tts-common: &tts-common
+  build:
+    context: ..
+    dockerfile: api/Dockerfile
+  volumes:
+    - ../voices:/voices:ro
+    - ../pretrained_models:/models
+    - /root/cosy_finetuned:/finetuned:ro
+  environment:
+    - NVIDIA_VISIBLE_DEVICES=all
+    - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    - MODEL_DIR=/models/Fun-CosyVoice3-0.5B
+    - LLM_MODEL_PATH=/finetuned/llm/epoch_4_whole_saved.pt
+    - FLOW_MODEL_PATH=/finetuned/flow/epoch_4_whole_saved.pt
+    - VOICES_DIR=/voices
+    - USE_FASTCOSYVOICE3=true
+    - FP16=true
+    - LOAD_TRT_FLOW=false
+    - LOAD_TRT_LLM=false
+    - USE_SPK2INFO_CACHE=true
+    - WARMUP_VOICE=polina
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+  restart: "no"
+  healthcheck:
+    test: ["CMD", "python3", "-c", "import json,urllib.request; r=urllib.request.urlopen('http://localhost:8090/health', timeout=3); data=json.load(r); assert data.get('status')=='ok'"]
+    interval: 15s
+    timeout: 10s
+    retries: 40
+    start_period: 30s
+
 services:
-  api:
-    container_name: cosyvoice3-tts
-    build:
-      context: ..
-      dockerfile: api/Dockerfile
+  api-tts-1:
+    <<: *tts-common
+    container_name: cosyvoice3-tts-1
     ports:
-      - "8093:8090"
+      - "8094:8090"
+
+  api-tts-2:
+    <<: *tts-common
+    container_name: cosyvoice3-tts-2
+    ports:
+      - "8095:8090"
+
+  nginx:
+    image: nginx:alpine
+    container_name: cosyvoice3-nginx
+    ports:
+      - "8093:80"
     volumes:
-      - ../voices:/voices:ro
-      - ../pretrained_models:/models
-      - /root/cosy_finetuned:/finetuned:ro
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - MODEL_DIR=/models/Fun-CosyVoice3-0.5B
-      - LLM_MODEL_PATH=/finetuned/llm/epoch_4_whole_saved.pt
-      - FLOW_MODEL_PATH=/finetuned/flow/epoch_4_whole_saved.pt
-      - VOICES_DIR=/voices
-      - USE_FASTCOSYVOICE3=true
-      - FP16=true
-      - LOAD_TRT_FLOW=false
-      - LOAD_TRT_LLM=false
-      - USE_SPK2INFO_CACHE=true
-      - WARMUP_VOICE=polina
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      api-tts-1:
+        condition: service_started
+      api-tts-2:
+        condition: service_started
     restart: "no"
     healthcheck:
-      test: ["CMD", "python3", "-c", "import json,urllib.request; r=urllib.request.urlopen('http://localhost:8090/health', timeout=3); data=json.load(r); assert data.get('status')=='ok'"]
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
       interval: 15s
       timeout: 10s
       retries: 40

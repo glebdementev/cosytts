@@ -588,7 +588,9 @@ class FastCosyVoice3Model:
         llm_thread.start()
         
         # Wait for LLM to finish generating all tokens
-        llm_thread.join()
+        llm_thread.join(timeout=60.0)
+        if llm_thread.is_alive():
+            logging.error('[TTS] LLM thread did not exit after 60s (non-stream)')
         
         # Get all tokens
         with tokens_lock:

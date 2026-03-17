@@ -25,6 +25,12 @@ from fastcosyvoice import FastCosyVoice3  # noqa: E402
 logger = logging.getLogger("cosyvoice3")
 
 TTFB_WARNING_THRESHOLD_S = float(os.getenv("TTS_TTFB_WARNING_S", "1.0"))
+SYNTHESIS_TIMEOUT_S = float(os.getenv("TTS_SYNTHESIS_TIMEOUT_S", "60.0"))
+CHUNK_TIMEOUT_S = float(os.getenv("TTS_CHUNK_TIMEOUT_S", "30.0"))
+
+
+class SynthesisTimeoutError(TimeoutError):
+    """Raised when TTS synthesis exceeds the configured timeout."""
 
 
 def _env_bool(name: str, default: str) -> bool:
@@ -280,15 +286,12 @@ class CosyVoice3StreamingTtsService:
         attempt: int,
     ) -> None:
         cancel_event.set()
-        if self.use_fast_pipeline:
-            worker.join(timeout=5.0)
-            if worker.is_alive():
-                logger.warning(
-                    "TTS worker still running after cancel on attempt %d",
-                    attempt,
-                )
-            return
-        worker.join()
+        worker.join(timeout=10.0)
+        if worker.is_alive():
+            logger.warning(
+                "TTS worker still running after cancel on attempt %d",
+                attempt,
+            )
 
     def _queue_stream(
         self,
@@ -296,7 +299,13 @@ class CosyVoice3StreamingTtsService:
         end_sentinel: object,
     ) -> Generator[bytes, None, None]:
         while True:
-            item = output_queue.get()
+            try:
+                item = output_queue.get(timeout=CHUNK_TIMEOUT_S)
+            except queue.Empty:
+                logger.error("TTS chunk timeout after %.0fs — aborting stream", CHUNK_TIMEOUT_S)
+                raise SynthesisTimeoutError(
+                    f"No audio chunk received for {CHUNK_TIMEOUT_S:.0f}s"
+                )
             if item is end_sentinel:
                 return
             if isinstance(item, Exception):
@@ -356,29 +365,38 @@ class CosyVoice3StreamingTtsService:
         t0 = time.perf_counter()
         warned_slow_ttfb = False
         while True:
+            elapsed = time.perf_counter() - t0
+            if elapsed >= SYNTHESIS_TIMEOUT_S:
+                cancel_event.set()
+                worker.join(timeout=5.0)
+                logger.error(
+                    "TTS first chunk timeout after %.1fs voice=%s — aborting",
+                    elapsed, request.voice,
+                )
+                raise SynthesisTimeoutError(
+                    f"No first audio chunk after {elapsed:.1f}s (limit {SYNTHESIS_TIMEOUT_S:.0f}s)"
+                )
+            remaining = SYNTHESIS_TIMEOUT_S - elapsed
             try:
                 if warned_slow_ttfb:
-                    first_item = output_queue.get()
+                    first_item = output_queue.get(timeout=min(5.0, remaining))
                 else:
-                    first_item = output_queue.get(timeout=TTFB_WARNING_THRESHOLD_S)
+                    first_item = output_queue.get(timeout=min(TTFB_WARNING_THRESHOLD_S, remaining))
                 break
             except queue.Empty:
-                warned_slow_ttfb = True
-                logger.warning(
-                    "TTS TTFB exceeded %.0fms voice=%s; waiting for first chunk",
-                    TTFB_WARNING_THRESHOLD_S * 1000,
-                    request.voice,
-                )
+                if not warned_slow_ttfb:
+                    warned_slow_ttfb = True
+                    logger.warning(
+                        "TTS TTFB exceeded %.0fms voice=%s; waiting for first chunk",
+                        TTFB_WARNING_THRESHOLD_S * 1000,
+                        request.voice,
+                    )
         elapsed_s = time.perf_counter() - t0
         ttfb_ms = elapsed_s * 1000.0
 
         if first_item is end_sentinel:
-            logger.info("TTS produced no audio on attempt %d", attempt)
-            return SynthesisResult(
-                stream=iter(()),  # type: ignore[arg-type]
-                ttfb_ms=ttfb_ms,
-                attempts=attempt,
-            )
+            logger.error("TTS produced no audio before stream end voice=%s", request.voice)
+            raise RuntimeError(f"TTS produced no audio for voice={request.voice}")
 
         if isinstance(first_item, Exception):
             raise first_item

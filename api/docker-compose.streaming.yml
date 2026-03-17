@@ -33,6 +33,7 @@ services:
     restart: "no"
     healthcheck:
       test: ["CMD", "python3", "-c", "import json,urllib.request; r=urllib.request.urlopen('http://localhost:8090/health', timeout=3); data=json.load(r); assert data.get('status')=='ok'"]
-      interval: 10s
-      timeout: 5s
-      retries: 6
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 30s

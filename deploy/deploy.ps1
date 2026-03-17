@@ -201,13 +201,20 @@ Invoke-Step "Verify streaming synthesis endpoint (remote from local)" {
 
     $streamUrl = "http://${SshHost}:${ApiPort}/synthesize/stream"
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    & curl.exe -fsS `
-      -X POST $streamUrl `
-      -H "Content-Type: application/json" `
-      --data-binary "@$requestJsonPath" `
-      --output $outputPcmPath
-    $sw.Stop()
-    if ($LASTEXITCODE -ne 0) { throw "Streaming synthesis request failed." }
+    try {
+      Invoke-WebRequest `
+        -Uri $streamUrl `
+        -Method Post `
+        -ContentType "application/json" `
+        -InFile $requestJsonPath `
+        -OutFile $outputPcmPath | Out-Null
+    }
+    catch {
+      throw "Streaming synthesis request failed: $($_.Exception.Message)"
+    }
+    finally {
+      $sw.Stop()
+    }
 
     $outInfo = Get-Item $outputPcmPath
     if ($outInfo.Length -le 0) {

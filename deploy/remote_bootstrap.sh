@@ -36,13 +36,30 @@ download_model() {
     # Ubuntu 24.04 uses externally-managed Python (PEP 668),
     # so install modelscope in a local venv instead of system Python.
     local venv_dir=".cache/modelscope-venv"
-    if ! python3 -m venv "${venv_dir}" 2>/dev/null; then
-      apt-get update
-      apt-get install -y --no-install-recommends python3-venv
-      python3 -m venv "${venv_dir}"
+    local rebuild_venv=false
+    if [[ ! -x "${venv_dir}/bin/python" ]]; then
+      rebuild_venv=true
     fi
-    "${venv_dir}/bin/python" -m pip install --quiet --upgrade pip
-    "${venv_dir}/bin/python" -m pip install --quiet modelscope
+    if [[ "${rebuild_venv}" == "true" ]]; then
+      rm -rf "${venv_dir}"
+      if ! python3 -m venv "${venv_dir}" 2>/dev/null; then
+        apt-get update
+        apt-get install -y --no-install-recommends python3-venv
+        python3 -m venv "${venv_dir}"
+      fi
+    fi
+    "${venv_dir}/bin/python" -m pip install --quiet --upgrade pip setuptools wheel packaging modelscope
+    if ! "${venv_dir}/bin/python" -c "import packaging, modelscope" >/dev/null 2>&1; then
+      echo "Cached modelscope venv is inconsistent; rebuilding..."
+      rm -rf "${venv_dir}"
+      python3 -m venv "${venv_dir}"
+      "${venv_dir}/bin/python" -m pip install --quiet --upgrade pip setuptools wheel packaging modelscope
+    fi
+    "${venv_dir}/bin/python" << 'PYEOF'
+import packaging
+import modelscope
+print("Verified download venv imports:", packaging.__version__, modelscope.__version__)
+PYEOF
     "${venv_dir}/bin/python" << 'PYEOF'
 from modelscope import snapshot_download
 snapshot_download("FunAudioLLM/Fun-CosyVoice3-0.5B-2512",

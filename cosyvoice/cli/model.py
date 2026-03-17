@@ -25,6 +25,10 @@ from cosyvoice.utils.common import fade_in_out
 from cosyvoice.utils.file_utils import convert_onnx_to_trt, export_cosyvoice2_vllm, export_flow_decoder_estimator_onnx, logging
 from cosyvoice.utils.common import TrtContextWrapper
 
+# Aggressive timeout: if LLM thread produces nothing for this long, abort.
+_LLM_JOIN_TIMEOUT_S = float(os.getenv('COSYVOICE_LLM_JOIN_TIMEOUT_S', '60'))
+_POLL_STALL_TIMEOUT_S = float(os.getenv('COSYVOICE_POLL_STALL_TIMEOUT_S', '30'))
+
 
 class CosyVoiceModel:
 
@@ -221,9 +225,20 @@ class CosyVoiceModel:
         p.start()
         if stream is True:
             token_hop_len = self.token_min_hop_len
+            last_progress_time = time.time()
+            last_token_count = 0
             while True:
                 time.sleep(0.0005)
-                if len(self.tts_speech_token_dict[this_uuid]) >= token_hop_len + self.token_overlap_len:
+                cur_tokens = len(self.tts_speech_token_dict[this_uuid])
+                if cur_tokens != last_token_count:
+                    last_token_count = cur_tokens
+                    last_progress_time = time.time()
+                elif time.time() - last_progress_time > _POLL_STALL_TIMEOUT_S and not self.llm_end_dict[this_uuid]:
+                    logging.error('[CosyVoiceModel] uuid=%s LLM stalled for %.0fs with %d tokens, aborting',
+                                  this_uuid, _POLL_STALL_TIMEOUT_S, cur_tokens)
+                    self.llm_end_dict[this_uuid] = True
+                    break
+                if cur_tokens >= token_hop_len + self.token_overlap_len:
                     this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:token_hop_len + self.token_overlap_len]) \
                         .unsqueeze(dim=0)
                     this_tts_speech = self.token2wav(token=this_tts_speech_token,
@@ -235,11 +250,15 @@ class CosyVoiceModel:
                     yield {'tts_speech': this_tts_speech.cpu()}
                     with self.lock:
                         self.tts_speech_token_dict[this_uuid] = self.tts_speech_token_dict[this_uuid][token_hop_len:]
+                    last_token_count = len(self.tts_speech_token_dict[this_uuid])
+                    last_progress_time = time.time()
                     # increase token_hop_len for better speech quality
                     token_hop_len = min(self.token_max_hop_len, int(token_hop_len * self.stream_scale_factor))
                 if self.llm_end_dict[this_uuid] is True and len(self.tts_speech_token_dict[this_uuid]) < token_hop_len + self.token_overlap_len:
                     break
-            p.join()
+            p.join(timeout=_LLM_JOIN_TIMEOUT_S)
+            if p.is_alive():
+                logging.error('[CosyVoiceModel] uuid=%s LLM thread did not exit after %.0fs', this_uuid, _LLM_JOIN_TIMEOUT_S)
             # deal with remain tokens, make sure inference remain token len equals token_hop_len when cache_speech is not None
             this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
             this_tts_speech = self.token2wav(token=this_tts_speech_token,
@@ -251,7 +270,9 @@ class CosyVoiceModel:
             yield {'tts_speech': this_tts_speech.cpu()}
         else:
             # deal with all tokens
-            p.join()
+            p.join(timeout=_LLM_JOIN_TIMEOUT_S)
+            if p.is_alive():
+                logging.error('[CosyVoiceModel] uuid=%s LLM thread did not exit after %.0fs (non-stream)', this_uuid, _LLM_JOIN_TIMEOUT_S)
             this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
             this_tts_speech = self.token2wav(token=this_tts_speech_token,
                                              prompt_token=flow_prompt_speech_token,
@@ -372,10 +393,21 @@ class CosyVoice2Model(CosyVoiceModel):
         if stream is True:
             token_offset = 0
             prompt_token_pad = int(np.ceil(flow_prompt_speech_token.shape[1] / self.token_hop_len) * self.token_hop_len - flow_prompt_speech_token.shape[1])
+            last_progress_time = time.time()
+            last_token_count = 0
             while True:
                 time.sleep(0.0005)
+                cur_tokens = len(self.tts_speech_token_dict[this_uuid])
+                if cur_tokens != last_token_count:
+                    last_token_count = cur_tokens
+                    last_progress_time = time.time()
+                elif time.time() - last_progress_time > _POLL_STALL_TIMEOUT_S and not self.llm_end_dict[this_uuid]:
+                    logging.error('[CosyVoice2Model] uuid=%s LLM stalled for %.0fs with %d tokens, aborting',
+                                  this_uuid, _POLL_STALL_TIMEOUT_S, cur_tokens)
+                    self.llm_end_dict[this_uuid] = True
+                    break
                 this_token_hop_len = self.token_hop_len + prompt_token_pad if token_offset == 0 else self.token_hop_len
-                if len(self.tts_speech_token_dict[this_uuid]) - token_offset >= this_token_hop_len + self.flow.pre_lookahead_len:
+                if cur_tokens - token_offset >= this_token_hop_len + self.flow.pre_lookahead_len:
                     this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:token_offset + this_token_hop_len + self.flow.pre_lookahead_len]).unsqueeze(dim=0)
                     this_tts_speech = self.token2wav(token=this_tts_speech_token,
                                                      prompt_token=flow_prompt_speech_token,
@@ -386,10 +418,13 @@ class CosyVoice2Model(CosyVoiceModel):
                                                      stream=stream,
                                                      finalize=False)
                     token_offset += this_token_hop_len
+                    last_progress_time = time.time()
                     yield {'tts_speech': this_tts_speech.cpu()}
                 if self.llm_end_dict[this_uuid] is True and len(self.tts_speech_token_dict[this_uuid]) - token_offset < this_token_hop_len + self.flow.pre_lookahead_len:
                     break
-            p.join()
+            p.join(timeout=_LLM_JOIN_TIMEOUT_S)
+            if p.is_alive():
+                logging.error('[CosyVoice2Model] uuid=%s LLM thread did not exit after %.0fs', this_uuid, _LLM_JOIN_TIMEOUT_S)
             # deal with remain tokens, make sure inference remain token len equals token_hop_len when cache_speech is not None
             this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
             this_tts_speech = self.token2wav(token=this_tts_speech_token,
@@ -402,7 +437,9 @@ class CosyVoice2Model(CosyVoiceModel):
             yield {'tts_speech': this_tts_speech.cpu()}
         else:
             # deal with all tokens
-            p.join()
+            p.join(timeout=_LLM_JOIN_TIMEOUT_S)
+            if p.is_alive():
+                logging.error('[CosyVoice2Model] uuid=%s LLM thread did not exit after %.0fs (non-stream)', this_uuid, _LLM_JOIN_TIMEOUT_S)
             this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
             this_tts_speech = self.token2wav(token=this_tts_speech_token,
                                              prompt_token=flow_prompt_speech_token,

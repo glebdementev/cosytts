@@ -24,8 +24,7 @@ from fastcosyvoice import FastCosyVoice3  # noqa: E402
 
 logger = logging.getLogger("cosyvoice3")
 
-MAX_RETRIES = 3
-TTFB_TIMEOUT_S = 1.0
+TTFB_WARNING_THRESHOLD_S = float(os.getenv("TTS_TTFB_WARNING_S", "1.0"))
 
 
 def _env_bool(name: str, default: str) -> bool:
@@ -305,18 +304,18 @@ class CosyVoice3StreamingTtsService:
             yield item
 
     # ------------------------------------------------------------------
-    # Public API — eager first-chunk with TTFB retry
+    # Public API — eager first-chunk validation
     # ------------------------------------------------------------------
 
     def stream_synthesize(self, request: StreamingTtsRequest) -> SynthesisResult:
-        """Start synthesis, eagerly validate TTFB, retry if slow.
+        """Start synthesis and wait for the first audio chunk.
 
         This is NOT a generator — it blocks until the first audio chunk
-        arrives (or all retries are exhausted), so the caller can decide
-        to return an HTTP error before committing a 200 response.
+        arrives, so the caller can avoid committing a 200 response before
+        synthesis has actually started.
 
         Returns a SynthesisResult whose .stream() yields audio bytes.
-        Raises RuntimeError if all attempts exceed the TTFB timeout.
+        Raises only if synthesis itself fails before the first chunk.
         """
         wav_path, reference_text = self._load_voice_profile(request.voice)
         prompt_text = f"{self.instruction}<|endofprompt|>{reference_text}"
@@ -336,76 +335,71 @@ class CosyVoice3StreamingTtsService:
         wav_path: str,
         spk_id: str,
     ) -> SynthesisResult:
-        for attempt in range(1, MAX_RETRIES + 1):
-            trimmer = (
-                LeadingSilenceTrimmer(self.silence_threshold)
-                if self.trim_leading_silence
-                else None
+        attempt = 1
+        trimmer = (
+            LeadingSilenceTrimmer(self.silence_threshold)
+            if self.trim_leading_silence
+            else None
+        )
+
+        if self.use_fast_pipeline:
+            gen = self._raw_stream_fast(
+                request, prompt_text, wav_path, spk_id, trimmer,
             )
+        else:
+            gen = self._raw_stream_standard(
+                request, prompt_text, wav_path, spk_id, trimmer,
+            )
+        cancel_event = threading.Event()
+        output_queue, worker, end_sentinel = self._start_stream_worker(gen, cancel_event)
 
-            if self.use_fast_pipeline:
-                gen = self._raw_stream_fast(
-                    request, prompt_text, wav_path, spk_id, trimmer,
-                )
-            else:
-                gen = self._raw_stream_standard(
-                    request, prompt_text, wav_path, spk_id, trimmer,
-                )
-            cancel_event = threading.Event()
-            output_queue, worker, end_sentinel = self._start_stream_worker(gen, cancel_event)
-
-            t0 = time.perf_counter()
+        t0 = time.perf_counter()
+        warned_slow_ttfb = False
+        while True:
             try:
-                first_item = output_queue.get(timeout=TTFB_TIMEOUT_S)
+                if warned_slow_ttfb:
+                    first_item = output_queue.get()
+                else:
+                    first_item = output_queue.get(timeout=TTFB_WARNING_THRESHOLD_S)
+                break
             except queue.Empty:
-                first_item = None
-            elapsed_s = time.perf_counter() - t0
-            ttfb_ms = elapsed_s * 1000.0
-
-            if first_item is None:
-                logger.error(
-                    "TTS TTFB exceeded %.0fms on attempt %d — retrying",
-                    TTFB_TIMEOUT_S * 1000,
-                    attempt,
+                warned_slow_ttfb = True
+                logger.warning(
+                    "TTS TTFB exceeded %.0fms voice=%s; waiting for first chunk",
+                    TTFB_WARNING_THRESHOLD_S * 1000,
+                    request.voice,
                 )
-                self._cancel_failed_attempt(cancel_event, worker, attempt)
-                continue
+        elapsed_s = time.perf_counter() - t0
+        ttfb_ms = elapsed_s * 1000.0
 
-            if first_item is end_sentinel:
-                logger.info("TTS produced no audio on attempt %d", attempt)
-                return SynthesisResult(
-                    stream=iter(()),  # type: ignore[arg-type]
-                    ttfb_ms=ttfb_ms,
-                    attempts=attempt,
-                )
-
-            if isinstance(first_item, Exception):
-                raise first_item
-
-            if elapsed_s > TTFB_TIMEOUT_S:
-                logger.error(
-                    "TTS TTFB %.0fms (>%.0fms) on attempt %d — retrying",
-                    ttfb_ms,
-                    TTFB_TIMEOUT_S * 1000,
-                    attempt,
-                )
-                self._cancel_failed_attempt(cancel_event, worker, attempt)
-                continue
-
-            logger.info(
-                "TTS TTFB %.0fms voice=%s (attempt %d)",
-                ttfb_ms, request.voice, attempt,
-            )
-            rest_stream = self._queue_stream(output_queue, end_sentinel)
+        if first_item is end_sentinel:
+            logger.info("TTS produced no audio on attempt %d", attempt)
             return SynthesisResult(
-                stream=self._chain_stream(first_item, rest_stream),
+                stream=iter(()),  # type: ignore[arg-type]
                 ttfb_ms=ttfb_ms,
                 attempts=attempt,
             )
 
-        raise RuntimeError(
-            f"TTS TTFB exceeded {TTFB_TIMEOUT_S:.0f}s on all "
-            f"{MAX_RETRIES} attempts for voice={request.voice}"
+        if isinstance(first_item, Exception):
+            raise first_item
+
+        if elapsed_s > TTFB_WARNING_THRESHOLD_S:
+            logger.warning(
+                "TTS TTFB %.0fms (>%.0fms) voice=%s",
+                ttfb_ms,
+                TTFB_WARNING_THRESHOLD_S * 1000,
+                request.voice,
+            )
+        else:
+            logger.info(
+                "TTS TTFB %.0fms voice=%s (attempt %d)",
+                ttfb_ms, request.voice, attempt,
+            )
+        rest_stream = self._queue_stream(output_queue, end_sentinel)
+        return SynthesisResult(
+            stream=self._chain_stream(first_item, rest_stream),
+            ttfb_ms=ttfb_ms,
+            attempts=attempt,
         )
 
     def _chain_stream(
